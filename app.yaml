@@ -1,0 +1,36 @@
+command:
+  - "python"
+  - "app.py"
+
+env:
+  # Lakebase autoscaling endpoint — injected automatically by the platform so the
+  # app's service principal gets CAN_CONNECT_AND_CREATE without manual grants.
+  - name: LAKEBASE_ENDPOINT
+    valueFrom: postgres
+  - name: LAKEBASE_DATABASE_NAME
+    value: "databricks_postgres"
+
+  # Deployment target injected by DABs — used by frontend to show the dev banner
+  - name: BUNDLE_TARGET
+    value: "${bundle.target}"
+
+  # Optional: JSON array of workspace configs for multi-workspace monitoring
+  - name: WORKSPACE_CONFIGS
+    value: ""
+
+  # Fernet key for encrypting the SP client_secret at rest in Lakebase / settings.json.
+  # Generate once and keep stable across deploys — rotating the key will invalidate
+  # any previously stored encrypted secret (you would need to re-enter it in the UI).
+  #
+  # Generate a key:
+  #   python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+  #
+  # Store it in a Databricks secret scope and reference it here, e.g.:
+  #   valueFrom: secret://your-scope/settings-encryption-key
+  #
+  # Or set it as a plain string for a simpler (but less ideal) setup:
+  #   value: "<your-generated-fernet-key>"
+  #
+  # If left empty, secrets are stored as plaintext (backward-compatible).
+  - name: SETTINGS_ENCRYPTION_KEY
+    value: ""

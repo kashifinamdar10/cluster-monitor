@@ -1,0 +1,60 @@
+# Snapshot job — records compute state every 5 minutes into Lakebase.
+#
+# Deploy pre-requisite: a Lakebase project must exist in this workspace.
+# Create it once a project slot is available:
+#   databricks postgres create-project cluster-monitor \
+#     --json '{"spec":{"display_name":"Cluster Monitor"}}' -t dev
+#
+# Then set in databricks.yml targets.dev.variables:
+#   lakebase_endpoint: "projects/cluster-monitor/branches/production/endpoints/primary"
+resources:
+  jobs:
+    cluster_monitor_snapshot:
+      name: cluster-monitor-snapshot
+      description: >
+        Captures a point-in-time snapshot of clusters, warehouses, pipelines, and
+        job runs into Lakebase every 5 minutes for history and uptime reporting.
+
+      # Every 5 minutes — periodic trigger only supports HOURS/DAYS/WEEKS,
+      # so use a quartz cron expression for sub-hourly schedules.
+      schedule:
+        quartz_cron_expression: "0 */5 * * * ?"
+        timezone_id: "UTC"
+        pause_status: PAUSED
+
+      job_clusters:
+        - job_cluster_key: snapshot_cluster
+          new_cluster:
+            # Single-node, small driver — snapshot_job.py is pure Python SDK calls
+            spark_version: "15.4.x-scala2.12"
+            node_type_id: Standard_DS3_v2
+            num_workers: 0
+            driver_node_type_id: Standard_DS3_v2
+            data_security_mode: SINGLE_USER
+            spark_conf:
+              spark.databricks.cluster.profile: singleNode
+              spark.master: "local[*]"
+            custom_tags:
+              ResourceClass: SingleNode
+            # Environment variables — picked up by os.getenv() in snapshot_job.py
+            spark_env_vars:
+              LAKEBASE_ENDPOINT:      "projects/cmon-${bundle.target}/branches/production/endpoints/primary"
+              LAKEBASE_DATABASE_NAME: "databricks_postgres"
+              WORKSPACE_CONFIGS:      "${var.workspace_configs}"
+              SNAPSHOT_FILE_PATH:     "${var.snapshot_file_path}"
+
+      tasks:
+        - task_key: snapshot
+          job_cluster_key: snapshot_cluster
+          spark_python_task:
+            python_file: ../snapshot_job.py
+          libraries:
+            - pypi:
+                package: psycopg[binary]>=3.0
+
+      email_notifications:
+        on_failure:
+          - ${workspace.current_user.userName}
+        no_alert_for_skipped_runs: true
+
+      max_concurrent_runs: 1

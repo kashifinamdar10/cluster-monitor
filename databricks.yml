@@ -1,0 +1,74 @@
+bundle:
+  name: cluster_monitor
+
+include:
+  - resources/*.yml
+
+# ── Bundle variables ──────────────────────────────────────────────────────────
+variables:
+
+  # Full path to the Lakebase database on the production branch.
+  # Discovered after initial project creation:
+  #   databricks postgres list-databases "projects/cmon-<target>/branches/production" --profile <profile>
+  # Set per-target below.
+  lakebase_database:
+    description: Full Lakebase database resource path (auto-generated on project creation).
+    default: ""
+
+  workspace_configs:
+    description: >
+      Optional JSON array of extra workspace configs to monitor (multi-workspace mode).
+      Format: [{"host":"https://...","token":"dapi...","name":"label"}]
+    default: ""
+
+  snapshot_file_path:
+    description: >
+      Volume path for JSON-file history storage (leave empty to use Lakebase instead).
+      Format: /Volumes/<catalog>/<schema>/<volume>/<dir>/
+    default: ""
+
+
+# ── Targets ───────────────────────────────────────────────────────────────────
+#
+# Both targets deploy to the same workspace. Environment isolation comes from:
+#   • mode: development — prefixes all resource names with "[dev <username>]"
+#   • Separate postgres_project per target — no shared database state
+#
+# Lakebase resources (project, branches, endpoint) are fully managed by DABs.
+# No manual CLI setup needed — `databricks bundle deploy` creates everything.
+
+targets:
+
+  # ── Development ──────────────────────────────────────────────────────────
+  # App:         [dev <username>] cluster-monitor
+  # Lakebase:    [dev <username>] cluster-monitor  (isolated project)
+  dev:
+    default: true
+    mode: development
+    bundle:
+      engine: direct   # skip terraform registry
+    workspace:
+      host: https://adb-984752964297111.11.azuredatabricks.net
+      workspace_id: "984752964297111"
+      profile: adb
+    variables:
+      lakebase_database: "projects/cmon-dev/branches/production/databases/databricks-postgres"
+
+  # ── Production ───────────────────────────────────────────────────────────
+  # App:         cluster-monitor
+  # Lakebase:    cluster-monitor  (isolated project)
+  prod:
+    mode: production
+    bundle:
+      engine: direct
+    workspace:
+      host: https://adb-984752964297111.11.azuredatabricks.net
+      workspace_id: "984752964297111"
+      profile: adb
+      root_path: /Workspace/Users/mohdkashif.inamdar@databricks.com/.bundle/${bundle.name}/${bundle.target}
+
+sync:
+  exclude:
+    - .databricks/**
+    - frontend/node_modules/**
+    - settings.json          # runtime-written; never upload or delete from remote

@@ -1,0 +1,68 @@
+# ── Python ──────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+*.egg
+.eggs/
+dist-packages/
+build/
+*.so
+
+# Virtual environments
+.venv/
+venv/
+env/
+.env
+
+# Test / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# ── Node / Frontend ──────────────────────────────────────────────────────────
+frontend/node_modules/
+frontend/.vite/
+frontend/tsconfig.tsbuildinfo
+
+# ── React build output ───────────────────────────────────────────────────────
+# dist/ is intentionally COMMITTED so the bundle deploy uploads a pre-built UI.
+# Remove this comment and uncomment the line below only if you switch to
+# a build-at-runtime approach.
+# dist/
+
+# ── Databricks ───────────────────────────────────────────────────────────────
+.databricks/
+
+# ── Local dev / AI tooling ───────────────────────────────────────────────────
+.claude/
+.cursor/
+SESSION_NOTES.md
+
+# ── Editor / OS ─────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.code-workspace
+
+# ── Secrets / local config ───────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+settings.json
+
+# ── Logs ─────────────────────────────────────────────────────────────────────
+*.log
+logs/
+
+# Local analysis artifacts (not part of the app)
+analysis/
+cluster_warehouse_monitor*.zip
+deploy/

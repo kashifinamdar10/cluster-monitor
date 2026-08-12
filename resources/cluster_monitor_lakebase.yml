@@ -1,0 +1,30 @@
+# Lakebase resources — DABs manages only what doesn't auto-exist.
+#
+# What Lakebase auto-creates on project provisioning:
+#   • "production" branch + its primary endpoint
+#
+# What Lakebase auto-creates when a new branch is created:
+#   • An endpoint on that branch
+#
+# So DABs only needs to declare:
+#   1. The project itself
+#   2. The dev branch (copy-on-write from production)
+#
+# Resource naming:
+#   dev  target → project "cmon-dev"
+#   prod target → project "cmon-prod"
+resources:
+
+  # ── Project ────────────────────────────────────────────────────────────────
+  postgres_projects:
+    lakebase:
+      project_id:   "cmon-${bundle.target}"
+      display_name: "Cluster Monitor (${bundle.target})"
+
+  # ── Dev branch (copy-on-write from auto-created production) ───────────────
+  postgres_branches:
+    dev:
+      branch_id:     "dev"
+      parent:        ${resources.postgres_projects.lakebase.id}
+      source_branch: "projects/cmon-${bundle.target}/branches/production"
+      no_expiry:     true

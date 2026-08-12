@@ -1,0 +1,122 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    @apply text-gray-800 antialiased;
+  }
+
+  /* ─── Dark mode — slate-tinted palette for depth and polish ───────────── */
+  .dark body {
+    background-color: #0f172a; /* slate-900 — page canvas */
+    color: #e2e8f0;            /* slate-200 — primary readable text */
+  }
+
+  /* ── Surfaces ─────────────────────────────────────────────────────────── */
+  /* Cards / panels sit one step lighter than the page canvas */
+  .dark .bg-white        { background-color: #1e293b !important; } /* slate-800 */
+  .dark .bg-gray-50      { background-color: #0f172a !important; } /* page bg */
+  .dark .bg-gray-100     { background-color: #1e293b !important; } /* card bg */
+  .dark .bg-gray-200     { background-color: #263349 !important; } /* elevated surface */
+  .dark .bg-gray-800     { background-color: #1e293b !important; } /* header / overlay bars */
+
+  /* ── Borders — visible but subtle ──────────────────────────────────────── */
+  .dark .border-gray-200 { border-color: #334155 !important; } /* slate-700 */
+  .dark .border-gray-100 { border-color: #334155 !important; }
+  .dark .divide-gray-100 > * + * { border-color: #334155 !important; }
+  .dark .border-gray-300 { border-color: #475569 !important; } /* slate-600 */
+  .dark .border-gray-700 { border-color: #334155 !important; }
+
+  /* ── Text — CORRECT hierarchy: lighter = more prominent on dark bg ──── */
+  .dark .text-gray-900 { color: #f8fafc !important; } /* near-white — headings */
+  .dark .text-gray-800 { color: #f1f5f9 !important; } /* slate-100  — primary body */
+  .dark .text-gray-700 { color: #e2e8f0 !important; } /* slate-200  — labels */
+  .dark .text-gray-600 { color: #cbd5e1 !important; } /* slate-300  — secondary */
+  .dark .text-gray-500 { color: #94a3b8 !important; } /* slate-400  — muted, readable */
+  .dark .text-gray-400 { color: #64748b !important; } /* slate-500  — hints/timestamps */
+
+  /* ── Tables ──────────────────────────────────────────────────────────── */
+  .dark tbody             { background-color: #1e293b; }
+  .dark tbody tr:hover    { background-color: #263349 !important; }
+  .dark thead tr          { background-color: #131e30 !important; }
+
+  /* ── Inputs / Selects ───────────────────────────────────────────────── */
+  .dark input:not([type="checkbox"]):not([type="radio"]),
+  .dark select,
+  .dark textarea {
+    background-color: #263349;
+    border-color: #334155;
+    color: #e2e8f0;
+  }
+  .dark input::placeholder,
+  .dark textarea::placeholder { color: #64748b; }
+
+  /* ── Range input ────────────────────────────────────────────────────── */
+  .dark input[type="range"] {
+    accent-color: #FF3621;
+  }
+
+  /* ── Code / pre ──────────────────────────────────────────────────────── */
+  .dark pre  { background-color: #080e1a !important; }
+  .dark code { color: #94a3b8; }
+
+  /* ── Scrollbar (Webkit) ──────────────────────────────────────────────── */
+  .dark ::-webkit-scrollbar       { width: 8px; height: 8px; }
+  .dark ::-webkit-scrollbar-track { background: #0f172a; }
+  .dark ::-webkit-scrollbar-thumb { background: #334155; border-radius: 4px; }
+  .dark ::-webkit-scrollbar-thumb:hover { background: #475569; }
+}
+
+@layer components {
+  .state-badge {
+    @apply inline-flex items-center rounded-full px-2 py-0.5 text-xs font-semibold;
+  }
+  .tab-btn {
+    @apply px-4 py-2 text-sm font-medium border-b-2 transition-colors whitespace-nowrap;
+  }
+  .tab-btn-active {
+    @apply border-dbx-red text-dbx-red;
+  }
+  .tab-btn-inactive {
+    @apply border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300
+           dark:text-gray-300 dark:hover:text-white dark:hover:border-gray-500;
+  }
+  .card {
+    @apply bg-white rounded-lg border border-gray-200 shadow-sm
+           dark:bg-gray-800 dark:border-gray-700;
+  }
+  .btn {
+    @apply inline-flex items-center gap-1.5 rounded px-3 py-1.5 text-sm font-medium
+           transition-colors focus:outline-none focus:ring-2 focus:ring-offset-1;
+  }
+  .btn-primary {
+    @apply btn bg-dbx-red text-white hover:bg-red-700 focus:ring-dbx-red;
+  }
+  .btn-outline {
+    @apply btn border border-gray-300 text-gray-700 hover:bg-gray-50 focus:ring-gray-300
+           dark:border-gray-600 dark:text-gray-200 dark:hover:bg-gray-700;
+  }
+  .input-select {
+    @apply rounded border border-gray-300 bg-white px-2 py-1 text-sm
+           focus:border-dbx-red focus:outline-none focus:ring-1 focus:ring-dbx-red
+           dark:bg-gray-700 dark:border-gray-600 dark:text-gray-100;
+  }
+  .table-th {
+    @apply px-3 py-2 text-left text-xs font-semibold uppercase tracking-wide
+           text-gray-500 bg-gray-50
+           dark:text-slate-400 dark:bg-slate-900;
+  }
+  .table-td {
+    @apply px-3 py-2 text-sm dark:text-slate-200;
+  }
+  .log-row {
+    @apply flex items-start gap-2 py-1 border-b border-gray-100 font-mono text-xs
+           dark:border-slate-700;
+  }
+  /* Section card used in Settings */
+  .section-card {
+    @apply bg-white rounded-lg border border-gray-200 p-4 space-y-3
+           dark:bg-slate-800 dark:border-slate-700;
+  }
+}

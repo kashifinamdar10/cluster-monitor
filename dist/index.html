@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Cluster &amp; Warehouse Monitor</title>
+    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='%23FF3621'><path d='M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5'/></svg>" />
+    <!-- Apply dark class before React hydrates to prevent flash -->
+    <script>
+      (function(){
+        var stored = localStorage.getItem('dbx-monitor-dark-mode');
+        var dark = stored !== null
+          ? stored === 'true'
+          : window.matchMedia('(prefers-color-scheme: dark)').matches;
+        if (dark) document.documentElement.classList.add('dark');
+      })();
+    </script>
+    <script type="module" crossorigin src="/assets/index-DxtX4HHQ.js"></script>
+    <link rel="stylesheet" crossorigin href="/assets/index-D0e0sBAx.css">
+  </head>
+  <body class="bg-gray-50">
+    <div id="root"></div>
+  </body>
+</html>

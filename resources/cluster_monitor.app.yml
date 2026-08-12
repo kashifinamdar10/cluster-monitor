@@ -1,0 +1,18 @@
+# Cluster Monitor — FastAPI + React app resource.
+#
+# The "postgres" app resource grants the app service principal
+# CAN_CONNECT_AND_CREATE on the production branch and injects
+# LAKEBASE_ENDPOINT automatically via `valueFrom: postgres` in app.yaml.
+resources:
+  apps:
+    cluster_monitor:
+      name: cluster-monitor
+      description: Monitor interactive clusters, warehouses, pipelines, and job runs.
+      source_code_path: ..
+
+      resources:
+        - name: postgres
+          postgres:
+            branch:     "projects/cmon-${bundle.target}/branches/production"
+            database:   "${var.lakebase_database}"
+            permission: CAN_CONNECT_AND_CREATE
