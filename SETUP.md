@@ -310,9 +310,14 @@ env:
 
 ---
 
-## 9. Optional: Multi-Workspace Monitoring
+## 9. Multi-Workspace Monitoring (classic scraper)
 
-To monitor compute across multiple Databricks workspaces, you need an **account-level service principal** with workspace admin on each target workspace.
+On this branch the **App does not scrape spokes**. A classic job in the hub workspace
+lists compute across workspaces and writes Lakebase; the App only reads snapshots.
+
+This avoids Apps Private Link failures such as:
+
+`Cert validation failed. Both workspace comparison and snp system trusted checks did not pass.`
 
 ### 9a. Create an account-level service principal
 
@@ -336,6 +341,9 @@ databricks workspace-assignment update \
   --profile <account-level-profile>
 ```
 
+Also ensure the **classic job cluster** in the hub can reach each spoke API
+(VNet peering / Private Link / NCC as required by your network team).
+
 ### 9c. Enter credentials in the app's Settings page
 
 Open the app → *Settings* → *Account Service Principal*. Enter:
@@ -344,6 +352,16 @@ Open the app → *Settings* → *Account Service Principal*. Enter:
 - Client Secret
 
 Click *Validate* to confirm connectivity, then *Discover Workspaces* to auto-populate the workspace list.
+Settings are stored in Lakebase and loaded by `snapshot_job.py` on every run.
+
+### 9d. Confirm the classic scrape job
+
+1. Jobs → `cluster-monitor-snapshot` → Run now (or click **Refresh All** in the App).
+2. Job logs should show per-workspace cluster/warehouse counts with **no** cert-validation errors.
+3. App tables populate from `GET /api/snapshot/latest`.
+
+> Prefer **one central classic scraper** when the hub already has network access to spokes.
+> Deploy per-workspace collector jobs only if hub→spoke API calls still fail from classic compute.
 
 ---
 
@@ -465,11 +483,17 @@ databricks apps deploy cluster-monitor \
 
 ---
 
-### Multi-workspace: some workspaces show no data
+### Multi-workspace: Cert validation failed / empty spoke data
 
-**Cause:** The account-level SP does not have workspace admin on those workspaces.
+**Cause:** The App (or serverless path) cannot reach spoke workspaces under Private Link /
+egress policy. Or the classic job still lacks network / admin on those spokes.
 
-**Fix:** In the app's Settings page, click *Check Permissions* to see which workspaces the SP can access. Use *Grant Admin* for any that show as non-admin, or grant access manually via the Account Console → Workspaces → [Workspace] → Permissions.
+**Fix:**
+1. Confirm scrapes run from **classic** `cluster-monitor-snapshot`, not from the App SSE path
+   (SSE is disabled / returns 410 on this branch).
+2. Fix hub classic → spoke API connectivity (peering / NCC / allowed domains).
+3. In Settings, *Check Permissions* / *Grant Admin* for the account SP on each spoke.
+4. Re-run the job and verify Lakebase `scrape_runs.status = completed`.
 
 ---
 

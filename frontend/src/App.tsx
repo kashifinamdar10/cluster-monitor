@@ -222,18 +222,20 @@ export default function App() {
             <span className="inline-block w-3 h-3 rounded-full bg-dbx-red" />
             Cluster &amp; Warehouse Monitor
           </h1>
-          <p className="text-xs text-gray-400">Real-time compute status across workspaces</p>
+          <p className="text-xs text-gray-400">
+            Classic-job snapshots across workspaces (Lakebase read-only UI)
+          </p>
         </div>
 
         <div className="flex items-center gap-2 flex-wrap">
           {/* Refresh status */}
           {lastRefresh && !loading && (
-            <span className="text-xs text-gray-400">Updated {lastRefresh}</span>
+            <span className="text-xs text-gray-400">Snapshot {lastRefresh}</span>
           )}
           {loading && (
             <span className="text-xs text-gray-400 flex items-center gap-1.5">
               <span className="w-1.5 h-1.5 rounded-full bg-dbx-red animate-pulse" />
-              Refreshing…
+              Scraping / loading…
             </span>
           )}
 
@@ -249,7 +251,7 @@ export default function App() {
           ) : (
             <button
               className="btn-primary text-xs py-1 px-2.5"
-              title={`Last refreshed: ${relativeTime(phaseLastRefreshed['all'])}`}
+              title={`Last snapshot: ${relativeTime(phaseLastRefreshed['all'])}. Triggers classic scrape job.`}
               onClick={() => manualRefresh('Refresh All')}
             >
               ↺ Refresh All
@@ -373,10 +375,10 @@ export default function App() {
           {/* Empty-state prompt — shown before first refresh */}
           {!loading && !lastRefresh && (
             <div className="rounded-lg border border-dashed border-gray-300 bg-white px-6 py-8 text-center">
-              <p className="text-gray-500 text-sm font-medium mb-1">No data loaded yet</p>
+              <p className="text-gray-500 text-sm font-medium mb-1">No snapshot loaded yet</p>
               <p className="text-gray-400 text-xs">
-                Click <span className="font-semibold text-gray-600">↺ Refresh All</span> to fetch current compute state,
-                or set an auto-refresh interval above.
+                Click <span className="font-semibold text-gray-600">↺ Refresh All</span> to trigger the
+                classic scrape job, or wait for the scheduled 5-minute run. Configure workspaces under Settings first.
               </p>
             </div>
           )}

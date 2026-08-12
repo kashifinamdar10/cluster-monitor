@@ -1,6 +1,17 @@
-const VERSION = '1.1.0'
+const VERSION = '1.2.0'
 
 const CHANGELOG: { version: string; date: string; changes: string[] }[] = [
+  {
+    version: '1.2.0',
+    date: 'August 2026',
+    changes: [
+      'Classic-compute central scraper: job is the sole multi-workspace writer',
+      'App UI is Lakebase-read-only — avoids Apps Private Link "Cert validation failed"',
+      'Refresh All triggers cluster-monitor-snapshot job and polls for new scrape_run_id',
+      'scrape_runs table tracks coherent snapshot cycles for the UI',
+      'Job loads workspace list + account SP from Lakebase app_settings',
+    ],
+  },
   {
     version: '1.1.0',
     date: 'May 2026',
@@ -59,8 +70,8 @@ const STACK: { layer: string; items: StackItem[] }[] = [
   {
     layer: 'Backend',
     items: [
-      { name: 'FastAPI',          role: 'REST API + Server-Sent Events streaming endpoint', href: 'https://fastapi.tiangolo.com' },
-      { name: 'Databricks SDK',   role: 'Workspace API client (clusters, warehouses, pipelines, jobs)', href: 'https://databricks-sdk-py.readthedocs.io' },
+      { name: 'FastAPI',          role: 'REST API — Lakebase-read-only snapshot endpoints', href: 'https://fastapi.tiangolo.com' },
+      { name: 'Databricks SDK',   role: 'Used by classic scrape job (clusters, warehouses, pipelines, jobs)', href: 'https://databricks-sdk-py.readthedocs.io' },
       { name: 'psycopg 3',        role: 'PostgreSQL driver for Lakebase connections',       href: 'https://www.psycopg.org/psycopg3/' },
       { name: 'Uvicorn',          role: 'ASGI server — entry point via app.py',             href: 'https://www.uvicorn.org' },
     ],
@@ -79,23 +90,23 @@ const STACK: { layer: string; items: StackItem[] }[] = [
 const FLOW_STEPS = [
   {
     step: '1',
-    title: 'App starts',
-    detail: 'FastAPI initialises the history backend (Lakebase or JSON file). The React SPA is served as static files from /dist.',
+    title: 'Classic scrape job',
+    detail: 'A classic single-node job (cluster-monitor-snapshot) runs every 5 minutes on approved VNet / Private Link connectivity. It loads workspace + SP config from Lakebase app_settings and lists compute across all enabled workspaces.',
   },
   {
     step: '2',
-    title: 'Snapshot seed',
-    detail: 'On page load the frontend calls GET /api/snapshot/latest. If a previous snapshot exists in Lakebase, the tables are pre-populated immediately — no waiting for a live fetch.',
+    title: 'Write to Lakebase',
+    detail: 'Each cycle gets a scrape_run_id. Resource rows are appended to resource_snapshots and the scrape_runs table is marked completed. The App never writes compute snapshots.',
   },
   {
     step: '3',
-    title: 'Live refresh',
-    detail: 'Clicking Refresh (or on auto-refresh timer) opens a Server-Sent Events connection to GET /api/compute/stream. The backend fans out to all configured workspaces concurrently via threading, streaming page-by-page results as JSON events. The frontend updates each tab incrementally as data arrives.',
+    title: 'Read-only App UI',
+    detail: 'On load (and auto-refresh) the frontend calls GET /api/snapshot/latest. Tables render the latest completed scrape. No cross-workspace SDK calls run inside the App — avoiding Apps egress / cert-validation failures.',
   },
   {
     step: '4',
-    title: 'Snapshot write',
-    detail: 'After a full unfiltered refresh completes, the accumulated resource list is persisted to Lakebase (or the JSON file) in a background thread — no blocking of the SSE response. Each row stores resource metadata plus a JSONB metadata column for type-specific fields.',
+    title: 'Manual Refresh',
+    detail: 'Refresh All calls POST /api/snapshot/trigger to start the classic job, then polls /api/snapshot/latest until scrape_run_id advances (or times out and reloads the latest available snapshot).',
   },
   {
     step: '5',
@@ -105,7 +116,7 @@ const FLOW_STEPS = [
   {
     step: '6',
     title: 'Needs Attention',
-    detail: 'On every data update the frontend evaluates all resources against attention predicates (error states, SERVICE_FAULT / CLIENT_ERROR termination types, FAILED pipelines, failed job runs). The tab badge shows a live count and each card links directly into the Databricks UI and relevant documentation.',
+    detail: 'On every snapshot load the frontend evaluates all resources against attention predicates (error states, SERVICE_FAULT / CLIENT_ERROR termination types, FAILED pipelines, failed job runs).',
   },
 ]
 
@@ -147,11 +158,8 @@ export function AboutPage({ workspaceHost, lakebaseProjectId }: AboutPageProps) 
             Databricks Compute Monitor
           </h1>
           <p className="mt-1 text-sm text-gray-500">
-            Real-time visibility into clusters, warehouses, pipelines, and job runs across
-            one or more Databricks workspaces — built and deployed as a{' '}
-            <ExternalLink href="https://docs.databricks.com/en/dev-tools/databricks-apps/index.html">
-              Databricks App
-            </ExternalLink>.
+            Classic-job snapshots of clusters, warehouses, pipelines, and job runs across
+            one or more Databricks workspaces — App UI is Lakebase-read-only (Private Link safe).
           </p>
         </div>
         <span className="flex-shrink-0 inline-flex items-center px-2.5 py-1 rounded-full text-xs font-semibold bg-blue-100 text-blue-700 border border-blue-200">
@@ -169,34 +177,30 @@ export function AboutPage({ workspaceHost, lakebaseProjectId }: AboutPageProps) 
   Browser (React SPA)
   ├── Hash-based tab router (#attention, #clusters, …)
   ├── useComputeData hook
-  │     ├── GET /api/snapshot/latest  ──► seed tables from Lakebase on load
-  │     ├── EventSource /api/compute/stream  ──► live SSE refresh
-  │     └── GET /api/workspaces  ──► resolve workspace → host URL
+  │     ├── GET  /api/snapshot/latest   ──► load tables from Lakebase
+  │     ├── POST /api/snapshot/trigger  ──► start classic scrape job
+  │     └── GET  /api/workspaces        ──► resolve workspace → host URL
   └── NeedsAttentionTab  ──► cross-resource error aggregation
 
-  FastAPI  (api/main.py)
-  ├── GET  /api/compute/stream  (SSE)
-  │     └── stream_compute()  ──► threads per workspace
-  │           ├── clusters.list()   (page_size=100)
-  │           ├── warehouses.list()
-  │           ├── pipelines.list()
-  │           └── jobs.list_runs()  (active_only=true)
+  FastAPI App  (api/main.py) — READ-ONLY for compute
   ├── GET  /api/snapshot/latest  ──► LakebaseBackend.get_latest_snapshot()
+  ├── POST /api/snapshot/trigger ──► jobs.run_now(cluster-monitor-snapshot)
   ├── GET  /api/history          ──► LAG() window query on resource_snapshots
-  ├── PUT  /api/settings         ──► hot-swap history backend
-  └── GET  /api/workspaces       ──► resolve workspace deep-link URLs
+  ├── PUT  /api/settings         ──► workspace list + account SP (for the job)
+  └── GET  /api/workspaces
 
-  Lakebase (PostgreSQL)           JSON Volume (fallback)
-  └── cluster_monitor schema      └── /Volumes/.../snapshots.jsonl
-        └── resource_snapshots          └── append-only JSONL records
-              ├── resource_type               (clusters, warehouses, …)
-              ├── resource_id
-              ├── state
-              ├── tags   JSONB
-              └── metadata  JSONB  ──► all type-specific fields
+  Classic scrape job  (snapshot_job.py on Standard_DS3_v2)
+  ├── load app_settings from Lakebase
+  ├── WorkspaceClient per enabled workspace (account SP)
+  │     ├── clusters.list() / warehouses.list()
+  │     ├── pipelines.list_pipelines() / jobs.list_runs(active_only)
+  └── store_snapshot(..., run_id) + scrape_runs table
 
-  Databricks SDK  (WorkspaceClient per workspace)
-  └── OAuth token auto-refresh every 50 min (background thread)
+  Lakebase (PostgreSQL)
+  └── cluster_monitor schema
+        ├── scrape_runs
+        ├── resource_snapshots (+ scrape_run_id)
+        └── app_settings
 `.trim()}</pre>
         </div>
       </section>

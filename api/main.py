@@ -1,28 +1,21 @@
 """FastAPI backend — serves compute data API and the React static build."""
-import asyncio
 import concurrent.futures
 import json
 import os
 import sys
-import threading
-import time
 from datetime import datetime
 from typing import Any, Union
 
 from fastapi import FastAPI, HTTPException, Query
 from typing import Optional
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 # Ensure project root is importable (backend.py lives at root)
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from backend import LakebaseBackend, JsonFileBackend  # noqa: E402
-from api.compute import (  # noqa: E402
-    fetch_clusters, fetch_single_cluster, fetch_warehouses, fetch_pipelines,
-    fetch_job_runs, stream_compute, ALL_PHASES,
-)
 import api.settings as settings_module  # noqa: E402
 from api.settings import (  # noqa: E402
     AppSettings, AccountSpSettings, WorkspaceConfig,
@@ -95,10 +88,15 @@ def _serialize(obj: Any) -> Any:
 
 
 # --- API routes ---
+# Compute tables are served from Lakebase snapshots written by the classic
+# scrape job. The App does NOT fan out WorkspaceClient calls to spoke workspaces
+# (that path fails under Private Link / Apps egress — "Cert validation failed").
 
 @app.get("/api/clusters")
 def get_clusters():
-    return fetch_clusters()
+    """Read-only: latest cluster rows from Lakebase."""
+    snap = _latest_snapshot_payload()
+    return snap["clusters"]
 
 
 @app.get("/api/clusters/{cluster_id}")
@@ -106,26 +104,26 @@ def get_cluster(
     cluster_id: str,
     workspace: Optional[str] = Query(default=None, description="Restrict to a single workspace name"),
 ):
-    """Fetch the current state of one cluster by ID."""
-    result = fetch_single_cluster(cluster_id, workspace_name=workspace)
-    if result is None:
-        raise HTTPException(status_code=404, detail=f"Cluster {cluster_id!r} not found")
-    return result
+    """Return a cluster from the latest Lakebase snapshot (no live SDK fetch)."""
+    for row in _latest_snapshot_payload()["clusters"]:
+        if row.get("id") == cluster_id and (not workspace or row.get("workspace") == workspace):
+            return row
+    raise HTTPException(status_code=404, detail=f"Cluster {cluster_id!r} not found in latest snapshot")
 
 
 @app.get("/api/warehouses")
 def get_warehouses():
-    return fetch_warehouses()
+    return _latest_snapshot_payload()["warehouses"]
 
 
 @app.get("/api/pipelines")
 def get_pipelines():
-    return fetch_pipelines()
+    return _latest_snapshot_payload()["pipelines"]
 
 
 @app.get("/api/job-runs")
 def get_job_runs():
-    return fetch_job_runs()
+    return _latest_snapshot_payload()["job_runs"]
 
 
 @app.get("/api/history")
@@ -144,21 +142,25 @@ def get_history(hours: int = Query(default=24, ge=1, le=168)):
         raise HTTPException(status_code=500, detail=str(exc))
 
 
-@app.get("/api/snapshot/latest")
-def get_latest_snapshot():
-    """Return the most recent persisted state for every resource.
-
-    Used by the frontend on load to seed the tables immediately, before the
-    user triggers a live refresh.  Returns an empty payload when no history
-    backend is configured or no snapshot has been stored yet.
-    """
+def _latest_snapshot_payload() -> dict:
+    """Shared helper for GET /api/snapshot/latest and read-only list routes."""
+    empty = {
+        "available": False,
+        "snapshot_time": None,
+        "scrape_run_id": None,
+        "scrape_status": None,
+        "clusters": [],
+        "warehouses": [],
+        "pipelines": [],
+        "job_runs": [],
+    }
     if not history_backend.is_available:
-        return {
-            "available": False, "snapshot_time": None,
-            "clusters": [], "warehouses": [], "pipelines": [], "job_runs": [],
-        }
+        return empty
     try:
         snap = history_backend.get_latest_snapshot()
+        scrape = None
+        if hasattr(history_backend, "get_latest_scrape_run"):
+            scrape = history_backend.get_latest_scrape_run()
         all_times = [
             r.get("snapshot_time")
             for items in snap.values()
@@ -166,9 +168,18 @@ def get_latest_snapshot():
             if r.get("snapshot_time")
         ]
         latest_time = max(all_times) if all_times else None
+        if scrape and scrape.get("finished_at"):
+            ft = scrape["finished_at"]
+            latest_time = ft.isoformat() if hasattr(ft, "isoformat") else str(ft)
+        elif scrape and scrape.get("started_at") and not latest_time:
+            st = scrape["started_at"]
+            latest_time = st.isoformat() if hasattr(st, "isoformat") else str(st)
         return {
-            "available":     True,
+            "available": True,
             "snapshot_time": latest_time,
+            "scrape_run_id": (scrape or {}).get("run_id"),
+            "scrape_status": (scrape or {}).get("status"),
+            "scrape_counts": _serialize((scrape or {}).get("counts") or {}),
             "clusters":   [_serialize(r) for r in snap.get("cluster",   [])],
             "warehouses": [_serialize(r) for r in snap.get("warehouse", [])],
             "pipelines":  [_serialize(r) for r in snap.get("pipeline",  [])],
@@ -178,120 +189,77 @@ def get_latest_snapshot():
         raise HTTPException(status_code=500, detail=str(exc))
 
 
-@app.get("/api/compute/stream")
-async def stream_compute_sse(
-    phases: Optional[str] = Query(
-        default=None,
-        description="Comma-separated resource types to fetch: clusters,warehouses,pipelines,job_runs",
-    ),
-    states: Optional[str] = Query(
-        default=None,
-        description="Comma-separated upper-case states to filter by, e.g. RUNNING,PENDING",
-    ),
-    workspace: Optional[str] = Query(
-        default=None,
-        description="Restrict fetch to a single workspace name",
-    ),
-):
-    """Server-Sent Events — streams compute data page-by-page.
+@app.get("/api/snapshot/latest")
+def get_latest_snapshot():
+    """Return the most recent classic-job snapshot for every resource.
 
-    Query params (all optional):
-      phases    — comma-separated subset: clusters,warehouses,pipelines,job_runs
-      states    — comma-separated state filter: RUNNING,PENDING,…
-      workspace — single workspace name to restrict to
-
-    Event types:
-      progress, {phase}_page, {phase}_done, error, done
+    This is the primary data source for the read-only App UI.
     """
-    loop = asyncio.get_event_loop()
-    q: asyncio.Queue[dict | None] = asyncio.Queue()
+    return _latest_snapshot_payload()
 
-    requested_phases = tuple(
-        p.strip() for p in phases.split(",") if p.strip() in ALL_PHASES
-    ) if phases else ALL_PHASES
 
-    state_filter = [s.strip().upper() for s in states.split(",") if s.strip()] if states else None
+@app.post("/api/snapshot/trigger")
+def trigger_snapshot():
+    """Kick off the classic scrape job (best-effort Refresh).
 
-    stream_compute(
-        q, loop,
-        phases=requested_phases,
-        state_filter=state_filter,
-        workspace_filter=workspace or None,
-    )
+    Requires the App SP to have CAN_MANAGE_RUN on cluster-monitor-snapshot.
+    Returns immediately with the Databricks job run_id; poll GET /api/snapshot/latest
+    until scrape_run_id advances.
+    """
+    job_name = os.getenv("SNAPSHOT_JOB_NAME", "cluster-monitor-snapshot")
+    try:
+        from databricks.sdk import WorkspaceClient
+        w = WorkspaceClient()
+        job_id = None
+        # Prefer explicit id from env (set after bundle deploy)
+        env_job_id = os.getenv("SNAPSHOT_JOB_ID", "").strip()
+        if env_job_id:
+            job_id = int(env_job_id)
+        else:
+            for j in w.jobs.list(name=job_name):
+                # Prefer exact name match; development mode prefixes "[dev user] "
+                settings_name = (j.settings.name if j.settings else "") or ""
+                if settings_name == job_name or settings_name.endswith(job_name):
+                    job_id = j.job_id
+                    break
+            if job_id is None:
+                # Fallback: first list hit for substring
+                for j in w.jobs.list():
+                    settings_name = (j.settings.name if j.settings else "") or ""
+                    if job_name in settings_name:
+                        job_id = j.job_id
+                        break
+        if job_id is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Scrape job {job_name!r} not found. Deploy the bundle or set SNAPSHOT_JOB_ID.",
+            )
+        run = w.jobs.run_now(job_id=job_id)
+        return {
+            "ok": True,
+            "job_id": job_id,
+            "job_name": job_name,
+            "run_id": run.run_id,
+            "message": "Classic scrape job started. Poll /api/snapshot/latest for new data.",
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
 
-    # Accumulate items for snapshotting only on full, unfiltered refreshes.
-    # Partial/filtered streams would store incomplete data and skew history.
-    should_snapshot = (
-        history_backend.is_available
-        and not state_filter
-        and set(requested_phases) == set(ALL_PHASES)
-    )
-    accumulated: dict[str, list[dict]] = {p: [] for p in ALL_PHASES}
 
-    _PHASE_TO_RTYPE = {
-        "clusters":   "cluster",
-        "warehouses": "warehouse",
-        "pipelines":  "pipeline",
-        "job_runs":   "job_run",
-    }
+@app.get("/api/compute/stream")
+async def stream_compute_sse():
+    """Deprecated — live multi-workspace scrape from the App is disabled.
 
-    async def generate():
-        while True:
-            msg = await q.get()
-            if msg is None:
-                # Sentinel — stream is done
-                break
-
-            # Collect items from page events so we can snapshot after the stream
-            if should_snapshot:
-                msg_type = msg.get("type", "")
-                for phase in ALL_PHASES:
-                    if msg_type == f"{phase}_page":
-                        accumulated[phase].extend(msg.get("items", []))
-
-            yield f"data: {json.dumps(msg)}\n\n"
-
-            # When the full stream finishes, persist the snapshot in a background
-            # thread so it doesn't block the final SSE event reaching the client.
-            if should_snapshot and msg.get("type") == "done":
-                snap_copy = dict(accumulated)
-                total_items = sum(len(v) for v in snap_copy.values())
-
-                # Emit a snapshot_saved event so the frontend activity log shows status
-                yield f"data: {json.dumps({'type': 'snapshot_saving', 'total': total_items})}\n\n"
-
-                def _store_snapshot(snap: dict[str, list[dict]]) -> None:
-                    stored = 0
-                    errors = []
-                    for phase, rtype in _PHASE_TO_RTYPE.items():
-                        items = snap.get(phase, [])
-                        if items:
-                            try:
-                                history_backend.store_snapshot(items, rtype)
-                                stored += len(items)
-                            except Exception as exc:
-                                errors.append(f"{rtype}: {exc}")
-                                print(f"WARNING: snapshot storage failed for {rtype}: {exc}")
-                    if errors:
-                        print(f"WARNING: {len(errors)} snapshot error(s): {'; '.join(errors)}")
-                    else:
-                        print(f"Snapshot stored: {stored} records")
-
-                threading.Thread(
-                    target=_store_snapshot,
-                    args=(snap_copy,),
-                    daemon=True,
-                    name="snapshot-writer",
-                ).start()
-
-    return StreamingResponse(
-        generate(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",   # disable nginx buffering
-            "Connection": "keep-alive",
-        },
+    Use classic-compute job + GET /api/snapshot/latest instead.
+    """
+    raise HTTPException(
+        status_code=410,
+        detail=(
+            "Live SSE scrape is disabled. The App is Lakebase-read-only; "
+            "run the classic cluster-monitor-snapshot job and poll /api/snapshot/latest."
+        ),
     )
 
 
@@ -785,9 +753,11 @@ def health():
         "status":              "ok",
         "history":             history_backend.is_available,
         "backend":             backend_type,
+        "mode":                "classic-scraper-readonly",
         "bundle_target":       os.getenv("BUNDLE_TARGET", ""),
         "workspace_host":      workspace_host.rstrip("/"),
         "lakebase_project_id": lakebase_project_id,
+        "snapshot_job_name":   os.getenv("SNAPSHOT_JOB_NAME", "cluster-monitor-snapshot"),
     }
 
 

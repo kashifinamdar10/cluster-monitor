@@ -14,7 +14,12 @@ env:
   - name: BUNDLE_TARGET
     value: "${bundle.target}"
 
+  # Classic scrape job name — used by POST /api/snapshot/trigger
+  - name: SNAPSHOT_JOB_NAME
+    value: "cluster-monitor-snapshot"
+
   # Optional: JSON array of workspace configs for multi-workspace monitoring
+  # Prefer configuring workspaces via the Settings UI (stored in Lakebase).
   - name: WORKSPACE_CONFIGS
     value: ""
 

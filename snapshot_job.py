@@ -1,19 +1,24 @@
-"""Databricks Job task: capture a point-in-time snapshot of all compute resources.
+"""Classic-compute scrape job: sole multi-workspace writer for Cluster Monitor.
 
-Runs on a schedule (e.g. every 5 minutes via the DAB job resource).
-Fetches live state from all configured workspaces and writes to the configured
-history backend (Lakebase or JSON file on a Volume).
+Runs on a classic single-node job cluster (VNet / Private Link friendly) and
+writes compute snapshots into Lakebase. The Databricks App UI is read-only and
+serves tables from these snapshots.
 
 Environment variables (injected by the Databricks Job runtime):
   LAKEBASE_ENDPOINT      — full endpoint resource name (same workspace as job)
   LAKEBASE_DATABASE_NAME — target database (default: databricks_postgres)
   SNAPSHOT_FILE_PATH     — JSONL Volume path, used when Lakebase is not set
-  WORKSPACE_CONFIGS      — optional JSON array of extra workspace configs
+  WORKSPACE_CONFIGS      — optional JSON array of extra workspace configs (legacy)
 
-Designed to run as a serverless Python task — no Spark cluster required.
+Workspace list + account SP are loaded from Lakebase app_settings (written by
+the Settings UI), with disk/env settings.json as fallback.
 """
-import sys
+from __future__ import annotations
+
 import os
+import sys
+import uuid
+from datetime import datetime, timezone
 
 # Ensure project root is on sys.path so api.* and backend can be imported.
 #
@@ -34,32 +39,83 @@ sys.path.insert(0, _script_dir)
 del _script_dir
 
 from api.compute import fetch_clusters, fetch_warehouses, fetch_pipelines, fetch_job_runs
-from api.settings import load_settings
+from api.settings import (
+    AppSettings,
+    load_settings,
+    set_current_settings,
+)
 from backend import LakebaseBackend, JsonFileBackend
 
 
-def main() -> None:
+def _load_runtime_settings(backend) -> AppSettings:
+    """Prefer Lakebase app_settings (UI-managed); fall back to disk/env."""
     settings = load_settings()
 
-    if settings.lakebase.endpoint:
-        backend = LakebaseBackend()
-    elif settings.json_storage.enabled and settings.json_storage.path:
-        backend = JsonFileBackend(settings.json_storage.path)
+    if isinstance(backend, LakebaseBackend) and backend.is_available:
+        raw = backend.load_app_settings()
+        if raw:
+            try:
+                settings = AppSettings.from_dict(raw)
+                print(
+                    f"Loaded settings from Lakebase — "
+                    f"{len(settings.workspaces)} workspace(s), "
+                    f"account_sp={'yes' if settings.account_sp.client_id else 'no'}"
+                )
+            except Exception as exc:
+                print(
+                    f"WARNING: Failed to parse Lakebase settings, using disk/env: {exc}",
+                    file=sys.stderr,
+                )
+
+    # Env endpoint wins when settings file has empty lakebase (Apps inject this).
+    if not settings.lakebase.endpoint and os.getenv("LAKEBASE_ENDPOINT"):
+        settings.lakebase.endpoint = os.getenv("LAKEBASE_ENDPOINT", "")
+    if os.getenv("LAKEBASE_DATABASE_NAME"):
+        settings.lakebase.database = os.getenv("LAKEBASE_DATABASE_NAME", "databricks_postgres")
+
+    set_current_settings(settings)
+    return settings
+
+
+def main() -> None:
+    # Initialize backend first so we can load settings from Lakebase.
+    # Endpoint may come from spark_env_vars before settings.json exists.
+    if os.getenv("LAKEBASE_ENDPOINT") or os.getenv("LAKEBASE_PG_URL"):
+        backend: LakebaseBackend | JsonFileBackend = LakebaseBackend()
     else:
-        print(
-            "No history backend configured — nothing to snapshot.\n"
-            "Set LAKEBASE_ENDPOINT or SNAPSHOT_FILE_PATH (with SNAPSHOT_FILE_ENABLED=true)."
-        )
-        # Return (not sys.exit) — spark_python_task runs via exec(), so sys.exit()
-        # raises SystemExit which Databricks marks as INTERNAL_ERROR even for code 0.
-        return
+        disk = load_settings()
+        if disk.lakebase.endpoint:
+            # Ensure env is set for LakebaseBackend module-level config
+            os.environ.setdefault("LAKEBASE_ENDPOINT", disk.lakebase.endpoint)
+            os.environ.setdefault(
+                "LAKEBASE_DATABASE_NAME",
+                disk.lakebase.database or "databricks_postgres",
+            )
+            backend = LakebaseBackend()
+        elif disk.json_storage.enabled and disk.json_storage.path:
+            backend = JsonFileBackend(disk.json_storage.path)
+        else:
+            print(
+                "No history backend configured — nothing to snapshot.\n"
+                "Set LAKEBASE_ENDPOINT or SNAPSHOT_FILE_PATH."
+            )
+            return
 
     backend.initialize()
-
     if not backend.is_available:
         print("History backend failed to initialise — exiting.", file=sys.stderr)
-        # Raise so the run is clearly marked FAILED (not a silent no-op)
         raise RuntimeError("History backend failed to initialise")
+
+    settings = _load_runtime_settings(backend)
+    enabled = [w for w in settings.workspaces if w.enabled]
+    print(
+        f"Starting classic scrape — "
+        f"{len(enabled) or 'default'} enabled workspace(s)"
+    )
+
+    run_id = f"scrape-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:8]}"
+    backend.begin_scrape_run(run_id)
+    print(f"scrape_run_id={run_id}")
 
     results: dict[str, int] = {}
     errors: list[str] = []
@@ -72,7 +128,7 @@ def main() -> None:
     ]:
         try:
             items = fetcher()
-            backend.store_snapshot(items, rtype)
+            backend.store_snapshot(items, rtype, run_id=run_id)
             results[label] = len(items)
             print(f"  ✓ {label}: {len(items)} snapshots stored")
         except Exception as exc:
@@ -83,10 +139,18 @@ def main() -> None:
     print(f"\nSnapshot complete — {total} records across {len(results)} resource types")
 
     if errors:
+        backend.complete_scrape_run(
+            run_id,
+            status="failed",
+            counts=results,
+            error="; ".join(errors),
+        )
         print(f"\n{len(errors)} error(s):")
         for e in errors:
             print(f"  - {e}", file=sys.stderr)
         raise RuntimeError(f"{len(errors)} snapshot error(s): {'; '.join(errors)}")
+
+    backend.complete_scrape_run(run_id, status="completed", counts=results)
 
 
 if __name__ == "__main__":

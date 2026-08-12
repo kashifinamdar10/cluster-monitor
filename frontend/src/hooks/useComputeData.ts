@@ -9,33 +9,19 @@ export const REFRESH_INTERVALS: Record<string, number | null> = {
   Off: null,
 }
 
-// SSE event shapes from /api/compute/stream
-interface ProgressEvent    { type: 'progress';          message: string }
-interface ClustersPage     { type: 'clusters_page';     workspace: string; page: number; count_so_far: number; items: Cluster[] }
-interface ClustersDone     { type: 'clusters_done';     workspace: string; total: number }
-interface WarehousesPage   { type: 'warehouses_page';   workspace: string; page: number; count_so_far: number; items: Warehouse[] }
-interface WarehousesDone   { type: 'warehouses_done';   workspace: string; total: number }
-interface PipelinesPage    { type: 'pipelines_page';    workspace: string; page: number; count_so_far: number; items: Pipeline[] }
-interface PipelinesDone    { type: 'pipelines_done';    workspace: string; total: number }
-interface JobRunsPage      { type: 'job_runs_page';     workspace: string; page: number; count_so_far: number; items: JobRun[] }
-interface JobRunsDone      { type: 'job_runs_done';     workspace: string; total: number }
-interface ErrorEvent        { type: 'error';            phase: string;     workspace: string; message: string }
-interface SnapshotSaving   { type: 'snapshot_saving';  total: number }
-interface DoneEvent        {
-  type: 'done'
-  total_clusters: number
-  total_warehouses: number
-  total_pipelines: number
-  total_job_runs: number
-}
 export type Phase = 'clusters' | 'warehouses' | 'pipelines' | 'job_runs'
 
-type StreamEvent =
-  | ProgressEvent | ClustersPage | ClustersDone
-  | WarehousesPage | WarehousesDone
-  | PipelinesPage | PipelinesDone
-  | JobRunsPage | JobRunsDone
-  | ErrorEvent | SnapshotSaving | DoneEvent
+interface SnapshotPayload {
+  available: boolean
+  snapshot_time?: string | null
+  scrape_run_id?: string | null
+  scrape_status?: string | null
+  scrape_counts?: Record<string, number>
+  clusters?: Cluster[]
+  warehouses?: Warehouse[]
+  pipelines?: Pipeline[]
+  job_runs?: JobRun[]
+}
 
 function ts() {
   return new Date().toLocaleTimeString('en-US', { hour12: false })
@@ -45,6 +31,13 @@ function entry(level: LogLevel, message: string): LogEntry {
   return { time: ts(), level, message }
 }
 
+function formatSnapshotLabel(iso: string | null | undefined): string {
+  if (!iso) return 'unknown'
+  const d = new Date(iso)
+  if (isNaN(d.getTime())) return iso
+  return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+}
+
 export function useComputeData() {
   const [clusters, setClusters]       = useState<Cluster[]>([])
   const [warehouses, setWarehouses]   = useState<Warehouse[]>([])
@@ -52,17 +45,16 @@ export function useComputeData() {
   const [jobRuns, setJobRuns]         = useState<JobRun[]>([])
   const [loading, setLoading]         = useState(false)
   const [lastRefresh, setLastRefresh] = useState<string | null>(null)
+  const [scrapeRunId, setScrapeRunId] = useState<string | null>(null)
   const [refreshInterval, setRefreshInterval] = useState<string>(() => {
     try { return localStorage.getItem('cluster-monitor:refresh-interval') ?? 'Off' } catch { return 'Off' }
   })
   const [log, setLog] = useState<LogEntry[]>([])
 
-  // Per-phase last-refresh timestamps (epoch ms) — used for button tooltips
   const [phaseLastRefreshed, setPhaseLastRefreshed] = useState<Record<Phase | 'all', number | null>>({
     clusters: null, warehouses: null, pipelines: null, job_runs: null, all: null,
   })
 
-  // Workspace name → host URL map for deep-link construction
   const [workspaceHosts, setWorkspaceHosts] = useState<Record<string, string>>({})
 
   const fetchWorkspaces = useCallback(() => {
@@ -78,7 +70,6 @@ export function useComputeData() {
 
   useEffect(() => { fetchWorkspaces() }, [fetchWorkspaces])
 
-  /** Re-fetch the workspace list and update deep-link hosts. Call after saving workspace config. */
   const reloadWorkspaces = useCallback(() => { fetchWorkspaces() }, [fetchWorkspaces])
 
   function stampPhase(phase: Phase | 'all') {
@@ -86,7 +77,7 @@ export function useComputeData() {
   }
 
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const esRef    = useRef<EventSource | null>(null)
+  const abortRef = useRef(false)
 
   const pushLog = useCallback((level: LogLevel, message: string) => {
     setLog(prev => [entry(level, message), ...prev].slice(0, 400))
@@ -94,212 +85,143 @@ export function useComputeData() {
 
   const clearLog = useCallback(() => setLog([]), [])
 
-  // ── Stream fetch ──────────────────────────────────────────────────────────
+  const applySnapshot = useCallback((data: SnapshotPayload, verbose: boolean, label: string) => {
+    if (!data.available) {
+      if (verbose) pushLog('warning', `${label}: no Lakebase snapshot available yet`)
+      return false
+    }
+    setClusters(data.clusters ?? [])
+    setWarehouses(data.warehouses ?? [])
+    setPipelines(data.pipelines ?? [])
+    setJobRuns(data.job_runs ?? [])
+    setScrapeRunId(data.scrape_run_id ?? null)
+    const labelTime = formatSnapshotLabel(data.snapshot_time)
+    setLastRefresh(labelTime)
+    stampPhase('all')
+    stampPhase('clusters')
+    stampPhase('warehouses')
+    stampPhase('pipelines')
+    stampPhase('job_runs')
+    const counts = data.scrape_counts || {}
+    pushLog(
+      'success',
+      `${label}: snapshot ${labelTime}` +
+        (data.scrape_run_id ? ` (${data.scrape_run_id})` : '') +
+        ` — ${data.clusters?.length ?? counts.clusters ?? 0} clusters, ` +
+        `${data.warehouses?.length ?? counts.warehouses ?? 0} warehouses, ` +
+        `${data.pipelines?.length ?? counts.pipelines ?? 0} pipelines, ` +
+        `${data.job_runs?.length ?? counts.job_runs ?? 0} job runs`,
+    )
+    return true
+  }, [pushLog])
 
-  /** Build the SSE URL for a targeted phase fetch (always unfiltered). */
-  function buildStreamUrl(phase?: Phase, workspace?: string): string {
-    const p = new URLSearchParams()
-    if (phase)     p.set('phases', phase)
-    if (workspace) p.set('workspace', workspace)
-    const qs = p.toString()
-    return qs ? `/api/compute/stream?${qs}` : '/api/compute/stream'
-  }
+  const loadSnapshot = useCallback(async (label: string, verbose: boolean): Promise<boolean> => {
+    try {
+      const res = await fetch('/api/snapshot/latest')
+      if (!res.ok) {
+        pushLog('error', `${label}: HTTP ${res.status}`)
+        return false
+      }
+      const data = (await res.json()) as SnapshotPayload
+      return applySnapshot(data, verbose, label)
+    } catch (err) {
+      pushLog('error', `${label}: ${String(err)}`)
+      return false
+    }
+  }, [applySnapshot, pushLog])
 
-  const openStream = useCallback(
-    (label: string, verbose: boolean, phase?: Phase, workspace?: string): Promise<boolean> => {
-      return new Promise(resolve => {
-        if (esRef.current) { esRef.current.close(); esRef.current = null }
+  const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
 
-        setLoading(true)
-        // For targeted refreshes, only clear the relevant slice
-        if (!phase) {
-          setClusters([])
-          setWarehouses([])
-          setPipelines([])
-          setJobRuns([])
-        } else if (phase === 'clusters')   { setClusters([]) }
-          else if (phase === 'warehouses') { setWarehouses([]) }
-          else if (phase === 'pipelines')  { setPipelines([]) }
-          else if (phase === 'job_runs')   { setJobRuns([]) }
+  /** Trigger classic scrape job, then poll Lakebase until scrape_run_id changes (or timeout). */
+  const triggerAndPoll = useCallback(async (label: string, verbose: boolean): Promise<boolean> => {
+    setLoading(true)
+    abortRef.current = false
+    const previousRunId = scrapeRunId
 
-        if (verbose) pushLog('info', `${label}: starting stream…`)
+    try {
+      if (verbose) pushLog('info', `${label}: triggering classic scrape job…`)
+      const trig = await fetch('/api/snapshot/trigger', { method: 'POST' })
+      if (trig.ok) {
+        const body = await trig.json()
+        pushLog('info', `Job run ${body.run_id} started — waiting for Lakebase snapshot…`)
+      } else {
+        const detail = await trig.text()
+        pushLog(
+          'warning',
+          `Could not trigger job (HTTP ${trig.status}) — reloading latest snapshot. ${detail.slice(0, 180)}`,
+        )
+        const ok = await loadSnapshot(label, verbose)
+        setLoading(false)
+        return ok
+      }
 
-        const es = new EventSource(buildStreamUrl(phase, workspace))
-        esRef.current = es
-        let hadError = false
-
-        es.onmessage = (ev: MessageEvent<string>) => {
-          const msg = JSON.parse(ev.data) as StreamEvent
-
-          switch (msg.type) {
-            // ── progress ────────────────────────────────────────────────────
-            case 'progress':
-              if (verbose) pushLog('info', msg.message)
-              break
-
-            // ── clusters ────────────────────────────────────────────────────
-            case 'clusters_page':
-              setClusters(prev => [...prev, ...msg.items])
-              if (verbose)
-                pushLog('info',
-                  `${msg.workspace} — clusters page ${msg.page}: ${msg.items.length} rows (${msg.count_so_far} so far)`)
-              break
-
-            case 'clusters_done':
-              stampPhase('clusters')
-              if (verbose)
-                pushLog('success', `${msg.workspace} — clusters complete: ${msg.total}`)
-              break
-
-            // ── warehouses ──────────────────────────────────────────────────
-            case 'warehouses_page':
-              setWarehouses(prev => [...prev, ...msg.items])
-              if (verbose)
-                pushLog('info',
-                  `${msg.workspace} — warehouses page ${msg.page}: ${msg.items.length} rows (${msg.count_so_far} so far)`)
-              break
-
-            case 'warehouses_done':
-              stampPhase('warehouses')
-              if (verbose)
-                pushLog('success', `${msg.workspace} — warehouses complete: ${msg.total}`)
-              break
-
-            // ── DLT pipelines ────────────────────────────────────────────────
-            case 'pipelines_page':
-              setPipelines(prev => [...prev, ...msg.items])
-              if (verbose)
-                pushLog('info',
-                  `${msg.workspace} — pipelines page ${msg.page}: ${msg.items.length} rows (${msg.count_so_far} so far)`)
-              break
-
-            case 'pipelines_done':
-              stampPhase('pipelines')
-              if (verbose)
-                pushLog('success', `${msg.workspace} — pipelines complete: ${msg.total}`)
-              break
-
-            // ── active job runs ──────────────────────────────────────────────
-            case 'job_runs_page':
-              setJobRuns(prev => [...prev, ...msg.items])
-              if (verbose)
-                pushLog('info',
-                  `${msg.workspace} — job runs page ${msg.page}: ${msg.items.length} rows (${msg.count_so_far} so far)`)
-              break
-
-            case 'job_runs_done':
-              stampPhase('job_runs')
-              if (verbose)
-                pushLog('success', `${msg.workspace} — job runs complete: ${msg.total}`)
-              break
-
-            // ── error ────────────────────────────────────────────────────────
-            case 'snapshot_saving':
-              pushLog('info', `Saving snapshot (${msg.total} records)…`)
-              break
-
-            case 'error':
-              hadError = true
-              pushLog('error', `${msg.phase}/${msg.workspace}: ${msg.message}`)
-              break
-
-            // ── final summary ────────────────────────────────────────────────
-            case 'done': {
-              es.close()
-              esRef.current = null
-              setLoading(false)
-              setLastRefresh(ts())
-              stampPhase('all')
-              const { total_clusters: tc, total_warehouses: tw,
-                      total_pipelines: tp, total_job_runs: tj } = msg
-              pushLog(
-                hadError ? 'warning' : 'success',
-                `${label} complete — ${tc} clusters, ${tw} warehouses, ` +
-                `${tp} pipelines, ${tj} active job runs` +
-                (hadError ? ' (some errors)' : ''),
-              )
-              resolve(!hadError)
-              break
-            }
-          }
-        }
-
-        es.onerror = () => {
-          hadError = true
-          pushLog('error', `${label}: SSE connection error`)
-          es.close()
-          esRef.current = null
+      const deadline = Date.now() + 180_000
+      while (Date.now() < deadline && !abortRef.current) {
+        await sleep(5_000)
+        if (abortRef.current) break
+        const res = await fetch('/api/snapshot/latest')
+        if (!res.ok) continue
+        const data = (await res.json()) as SnapshotPayload
+        if (
+          data.available &&
+          data.scrape_status === 'completed' &&
+          data.scrape_run_id &&
+          data.scrape_run_id !== previousRunId
+        ) {
+          applySnapshot(data, verbose, label)
           setLoading(false)
-          resolve(false)
+          return true
         }
-      })
-    },
-    [pushLog],
-  )
+        if (verbose) {
+          pushLog('info', `Waiting for scrape… status=${data.scrape_status ?? 'n/a'}`)
+        }
+      }
 
-  // Persist interval preference
+      pushLog('warning', `${label}: timed out waiting for new scrape — loading latest available`)
+      const ok = await loadSnapshot(label, verbose)
+      setLoading(false)
+      return ok
+    } catch (err) {
+      pushLog('error', `${label}: ${String(err)}`)
+      setLoading(false)
+      return false
+    }
+  }, [applySnapshot, loadSnapshot, pushLog, scrapeRunId])
+
   useEffect(() => {
     try { localStorage.setItem('cluster-monitor:refresh-interval', refreshInterval) } catch { /* ignore */ }
   }, [refreshInterval])
 
-  // ── Seed tables from last stored snapshot on first mount ─────────────────
-
+  // Seed tables from Lakebase on mount
   useEffect(() => {
-    async function loadSnapshot() {
-      try {
-        const res = await fetch('/api/snapshot/latest')
-        if (!res.ok) return
-        const data = await res.json()
-        if (!data.available) return
-        if (data.clusters?.length)   setClusters(data.clusters)
-        if (data.warehouses?.length) setWarehouses(data.warehouses)
-        if (data.pipelines?.length)  setPipelines(data.pipelines)
-        if (data.job_runs?.length)   setJobRuns(data.job_runs)
-        if (data.snapshot_time) {
-          const d = new Date(data.snapshot_time)
-          const label = isNaN(d.getTime())
-            ? data.snapshot_time
-            : d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
-          setLastRefresh(`snapshot ${label}`)
-          pushLog('info', `Loaded last snapshot (${label}) — click Refresh for live data`)
-        }
-      } catch {
-        // History not configured or unavailable — silent fail
-      }
-    }
-    loadSnapshot()
+    loadSnapshot('Load snapshot', true)
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
-
-  // ── Auto-refresh scheduling ───────────────────────────────────────────────
 
   const scheduleNext = useCallback(() => {
     if (timerRef.current) clearTimeout(timerRef.current)
     const ms = REFRESH_INTERVALS[refreshInterval]
     if (ms === null) return
     timerRef.current = setTimeout(async () => {
-      await openStream('auto-refresh', false)
+      // Auto-refresh only reloads Lakebase (does not start a new job each tick)
+      setLoading(true)
+      await loadSnapshot('auto-refresh', false)
+      setLoading(false)
       scheduleNext()
     }, ms)
-  }, [openStream, refreshInterval])
+  }, [loadSnapshot, refreshInterval])
 
   useEffect(() => {
-    // No automatic load on mount — user clicks Refresh to pull data.
-    // If an auto-refresh interval is active, schedule the first tick normally
-    // so it fires after the configured delay (not immediately).
     scheduleNext()
     return () => {
       if (timerRef.current) clearTimeout(timerRef.current)
-      if (esRef.current) { esRef.current.close(); esRef.current = null }
+      abortRef.current = true
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [refreshInterval])
 
   const stopStream = useCallback(() => {
-    if (esRef.current) {
-      esRef.current.close()
-      esRef.current = null
-    }
+    abortRef.current = true
     if (timerRef.current) {
       clearTimeout(timerRef.current)
       timerRef.current = null
@@ -308,44 +230,42 @@ export function useComputeData() {
     pushLog('warning', 'Refresh stopped by user')
   }, [pushLog])
 
+  /** Manual Refresh: trigger classic job + poll (falls back to reload). */
   const manualRefresh = useCallback(
     (label: string) => {
       if (timerRef.current) clearTimeout(timerRef.current)
-      openStream(label, true).then(() => scheduleNext())
+      triggerAndPoll(label, true).then(() => scheduleNext())
     },
-    [openStream, scheduleNext],
+    [scheduleNext, triggerAndPoll],
   )
 
-  /** Refresh a single resource type — always unfiltered; display filters apply client-side. */
+  /** Phase buttons reload Lakebase only (job already scraped all types together). */
   const targetedRefresh = useCallback(
     (phase: Phase) => {
-      openStream(`Refresh ${phase.replace('_', ' ')}`, true, phase)
-      // Don't reschedule the full auto-refresh timer — that continues independently
+      setLoading(true)
+      loadSnapshot(`Reload ${phase.replace('_', ' ')}`, true).finally(() => setLoading(false))
     },
-    [openStream],
+    [loadSnapshot],
   )
 
-  /**
-   * Fetch the latest state of one cluster and patch it in-place.
-   * Returns true on success, false on error.
-   */
+  /** Row refresh: re-read snapshot (no live SDK). */
   const refreshCluster = useCallback(
     async (clusterId: string, workspace: string): Promise<boolean> => {
       try {
         const qs = workspace ? `?workspace=${encodeURIComponent(workspace)}` : ''
         const res = await fetch(`/api/clusters/${encodeURIComponent(clusterId)}${qs}`)
         if (!res.ok) {
-          pushLog('error', `Refresh cluster ${clusterId}: HTTP ${res.status}`)
+          pushLog('error', `Cluster ${clusterId}: not in latest snapshot (HTTP ${res.status})`)
           return false
         }
         const updated = await res.json()
         setClusters(prev =>
           prev.map(c => (c.id === clusterId && c.workspace === workspace ? updated : c))
         )
-        pushLog('success', `${workspace}/${updated.name}: ${updated.state}`)
+        pushLog('info', `${workspace}/${updated.name}: ${updated.state} (from snapshot)`)
         return true
       } catch (err) {
-        pushLog('error', `Refresh cluster ${clusterId}: ${String(err)}`)
+        pushLog('error', `Cluster ${clusterId}: ${String(err)}`)
         return false
       }
     },
@@ -359,6 +279,7 @@ export function useComputeData() {
     jobRuns,
     loading,
     lastRefresh,
+    scrapeRunId,
     refreshInterval,
     setRefreshInterval,
     manualRefresh,

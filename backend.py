@@ -28,11 +28,20 @@ from databricks.sdk import WorkspaceClient
 # startup before the package list is read, or lightweight test runners).
 
 # ── Configuration ─────────────────────────────────────────────────────────────
-LAKEBASE_ENDPOINT = os.getenv("LAKEBASE_ENDPOINT", "")   # autoscaling endpoint name
-LAKEBASE_DATABASE = os.getenv("LAKEBASE_DATABASE_NAME", "databricks_postgres")
-LAKEBASE_PG_URL   = os.getenv("LAKEBASE_PG_URL", "")     # static URL for local dev
-
+# Resolved at initialize()-time so spark_env_vars / late os.environ updates apply.
 TOKEN_REFRESH_INTERVAL = 50 * 60   # seconds (refresh well before 1-hour expiry)
+
+
+def _lakebase_endpoint() -> str:
+    return os.getenv("LAKEBASE_ENDPOINT", "")
+
+
+def _lakebase_database() -> str:
+    return os.getenv("LAKEBASE_DATABASE_NAME", "databricks_postgres")
+
+
+def _lakebase_pg_url() -> str:
+    return os.getenv("LAKEBASE_PG_URL", "")
 
 
 class LakebaseBackend:
@@ -55,10 +64,12 @@ class LakebaseBackend:
 
     def initialize(self) -> None:
         """Set up connection and ensure schema exists."""
-        if LAKEBASE_PG_URL:
-            self._conn_string = LAKEBASE_PG_URL
+        pg_url = _lakebase_pg_url()
+        endpoint = _lakebase_endpoint()
+        if pg_url:
+            self._conn_string = pg_url
             print("Lakebase: using static LAKEBASE_PG_URL (local dev mode)")
-        elif LAKEBASE_ENDPOINT:
+        elif endpoint:
             self._setup_oauth_connection()
         else:
             print(
@@ -76,13 +87,96 @@ class LakebaseBackend:
             return
 
         self._initialized = True
-        print(f"Lakebase backend ready (endpoint: {LAKEBASE_ENDPOINT or 'local'})")
+        print(f"Lakebase backend ready (endpoint: {endpoint or 'local'})")
 
     @property
     def is_available(self) -> bool:
         return self._initialized
 
-    def store_snapshot(self, resources: list[dict], resource_type: str) -> None:
+    def begin_scrape_run(self, run_id: str) -> None:
+        """Mark a new classic-job scrape cycle as running."""
+        if not self._initialized:
+            return
+        with self._get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO cluster_monitor.scrape_runs
+                        (run_id, started_at, status, counts)
+                    VALUES (%s, NOW(), 'running', '{}'::jsonb)
+                    ON CONFLICT (run_id) DO UPDATE
+                        SET started_at = EXCLUDED.started_at,
+                            status = 'running',
+                            finished_at = NULL,
+                            counts = '{}'::jsonb,
+                            error = NULL
+                    """,
+                    (run_id,),
+                )
+            conn.commit()
+
+    def complete_scrape_run(
+        self,
+        run_id: str,
+        *,
+        status: str = "completed",
+        counts: Optional[dict] = None,
+        error: Optional[str] = None,
+    ) -> None:
+        """Mark a scrape cycle completed or failed."""
+        if not self._initialized:
+            return
+        with self._get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE cluster_monitor.scrape_runs
+                    SET finished_at = NOW(),
+                        status = %s,
+                        counts = %s::jsonb,
+                        error = %s
+                    WHERE run_id = %s
+                    """,
+                    (status, json.dumps(counts or {}), error, run_id),
+                )
+            conn.commit()
+
+    def get_latest_scrape_run(self) -> Optional[dict]:
+        """Return the most recent scrape_runs row (prefer completed)."""
+        if not self._initialized:
+            return None
+        with self._get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT run_id, started_at, finished_at, status, counts, error
+                    FROM cluster_monitor.scrape_runs
+                    WHERE status = 'completed'
+                    ORDER BY finished_at DESC NULLS LAST, started_at DESC
+                    LIMIT 1
+                    """
+                )
+                row = cur.fetchone()
+                if row:
+                    return dict(row)
+                cur.execute(
+                    """
+                    SELECT run_id, started_at, finished_at, status, counts, error
+                    FROM cluster_monitor.scrape_runs
+                    ORDER BY started_at DESC
+                    LIMIT 1
+                    """
+                )
+                row = cur.fetchone()
+                return dict(row) if row else None
+
+    def store_snapshot(
+        self,
+        resources: list[dict],
+        resource_type: str,
+        *,
+        run_id: Optional[str] = None,
+    ) -> None:
         """Persist a batch of resource states as a point-in-time snapshot."""
         if not self._initialized:
             return
@@ -108,6 +202,7 @@ class LakebaseBackend:
                         "is_job_cluster", "is_pipeline_cluster",
                     )
                 }),
+                run_id,
             )
             for r in resources
         ]
@@ -118,8 +213,9 @@ class LakebaseBackend:
                     """
                     INSERT INTO cluster_monitor.resource_snapshots
                         (snapshot_time, resource_type, resource_id, resource_name,
-                         workspace, state, cluster_source, creator, tags, metadata)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                         workspace, state, cluster_source, creator, tags, metadata,
+                         scrape_run_id)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """,
                     rows,
                 )
@@ -167,8 +263,8 @@ class LakebaseBackend:
     def get_latest_snapshot(self) -> dict[str, list[dict]]:
         """Return the most recent stored state for every resource (one row per ID).
 
-        Used to seed the dashboard on app load so the tables are not empty
-        before the first live refresh completes.
+        Prefer rows from the latest completed scrape_run so the UI sees one
+        coherent classic-job cycle. Fall back to DISTINCT ON by time.
         """
         if not self._initialized:
             return {}
@@ -176,15 +272,30 @@ class LakebaseBackend:
         result: dict[str, list[dict]] = {
             "cluster": [], "warehouse": [], "pipeline": [], "job_run": [],
         }
+        latest_run = self.get_latest_scrape_run()
+        run_id = (latest_run or {}).get("run_id") if (latest_run or {}).get("status") == "completed" else None
+
         with self._get_conn() as conn:
             with conn.cursor() as cur:
-                cur.execute("""
-                    SELECT DISTINCT ON (resource_type, resource_id)
-                        resource_type, resource_id, resource_name, workspace, state,
-                        cluster_source, creator, tags, metadata, snapshot_time
-                    FROM cluster_monitor.resource_snapshots
-                    ORDER BY resource_type, resource_id, snapshot_time DESC
-                """)
+                if run_id:
+                    cur.execute("""
+                        SELECT DISTINCT ON (resource_type, resource_id)
+                            resource_type, resource_id, resource_name, workspace, state,
+                            cluster_source, creator, tags, metadata, snapshot_time,
+                            scrape_run_id
+                        FROM cluster_monitor.resource_snapshots
+                        WHERE scrape_run_id = %s
+                        ORDER BY resource_type, resource_id, snapshot_time DESC
+                    """, (run_id,))
+                else:
+                    cur.execute("""
+                        SELECT DISTINCT ON (resource_type, resource_id)
+                            resource_type, resource_id, resource_name, workspace, state,
+                            cluster_source, creator, tags, metadata, snapshot_time,
+                            scrape_run_id
+                        FROM cluster_monitor.resource_snapshots
+                        ORDER BY resource_type, resource_id, snapshot_time DESC
+                    """)
                 rows = cur.fetchall()
 
         for row in rows:
@@ -292,7 +403,7 @@ class LakebaseBackend:
     def _setup_oauth_connection(self) -> None:
         """Resolve endpoint host and generate first OAuth token."""
         w = WorkspaceClient()
-        endpoint = w.postgres.get_endpoint(name=LAKEBASE_ENDPOINT)
+        endpoint = w.postgres.get_endpoint(name=_lakebase_endpoint())
         self._host = endpoint.status.hosts.host
         self._username = w.current_user.me().user_name
         self._token = self._generate_token(w)
@@ -303,13 +414,13 @@ class LakebaseBackend:
         """Generate a fresh OAuth database credential token."""
         if w is None:
             w = WorkspaceClient()
-        cred = w.postgres.generate_database_credential(endpoint=LAKEBASE_ENDPOINT)
+        cred = w.postgres.generate_database_credential(endpoint=_lakebase_endpoint())
         return cred.token
 
     def _build_conn_string(self) -> str:
         return (
             f"host={self._host} "
-            f"dbname={LAKEBASE_DATABASE} "
+            f"dbname={_lakebase_database()} "
             f"user={self._username} "
             f"password={self._token} "
             f"sslmode=require"
@@ -354,7 +465,8 @@ class LakebaseBackend:
                         cluster_source  VARCHAR(50),
                         creator         VARCHAR(255),
                         tags            JSONB DEFAULT '{}',
-                        metadata        JSONB DEFAULT '{}'
+                        metadata        JSONB DEFAULT '{}',
+                        scrape_run_id   VARCHAR(64)
                     );
 
                     CREATE INDEX IF NOT EXISTS idx_snapshots_time
@@ -363,6 +475,23 @@ class LakebaseBackend:
                         ON cluster_monitor.resource_snapshots (resource_type, resource_id);
                     CREATE INDEX IF NOT EXISTS idx_snapshots_state
                         ON cluster_monitor.resource_snapshots (state);
+                    CREATE INDEX IF NOT EXISTS idx_snapshots_scrape_run
+                        ON cluster_monitor.resource_snapshots (scrape_run_id);
+                """)
+                # Existing deployments may pre-date scrape_run_id — add if missing.
+                cur.execute("""
+                    ALTER TABLE cluster_monitor.resource_snapshots
+                    ADD COLUMN IF NOT EXISTS scrape_run_id VARCHAR(64)
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS cluster_monitor.scrape_runs (
+                        run_id      VARCHAR(64) PRIMARY KEY,
+                        started_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        finished_at TIMESTAMPTZ,
+                        status      VARCHAR(20) NOT NULL DEFAULT 'running',
+                        counts      JSONB DEFAULT '{}',
+                        error       TEXT
+                    )
                 """)
                 # Singleton settings row — survives all deploys.
                 cur.execute("""
@@ -462,7 +591,13 @@ class JsonFileBackend:
     def is_available(self) -> bool:
         return self._initialized
 
-    def store_snapshot(self, resources: list[dict], resource_type: str) -> None:
+    def store_snapshot(
+        self,
+        resources: list[dict],
+        resource_type: str,
+        *,
+        run_id: Optional[str] = None,
+    ) -> None:
         if not self._initialized:
             return
         now_iso = datetime.utcnow().isoformat()
@@ -474,6 +609,7 @@ class JsonFileBackend:
                 # Store canonical id/name for later lookup regardless of field name
                 "resource_id":    r.get("id") or r.get("run_id", ""),
                 "resource_name":  r.get("name") or r.get("run_name", ""),
+                "scrape_run_id":  run_id,
                 # Include every original field so type-specific data is preserved
                 **r,
             }
@@ -481,6 +617,23 @@ class JsonFileBackend:
         with self._lock:
             with open(self._path, "a", encoding="utf-8") as fh:
                 fh.write("\n".join(lines) + "\n")
+
+    def begin_scrape_run(self, run_id: str) -> None:
+        """No-op for JSON backend — run_id is embedded in snapshot lines."""
+        return None
+
+    def complete_scrape_run(
+        self,
+        run_id: str,
+        *,
+        status: str = "completed",
+        counts: Optional[dict] = None,
+        error: Optional[str] = None,
+    ) -> None:
+        return None
+
+    def get_latest_scrape_run(self) -> Optional[dict]:
+        return None
 
     def _read_records(self, since: datetime) -> list[dict]:
         """Return all records newer than *since*."""
