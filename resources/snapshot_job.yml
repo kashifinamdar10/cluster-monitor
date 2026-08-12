@@ -1,57 +1,39 @@
-# Classic-compute scrape job — sole multi-workspace writer for Cluster Monitor.
+# Scrape job — sole multi-workspace writer for Cluster Monitor.
 #
-# Runs on a classic single-node Azure job cluster so Private Link / VNet
-# connectivity to spoke workspaces works (Databricks Apps often cannot).
-# The App UI is read-only against Lakebase snapshots produced here.
-#
-# Pause in the Jobs UI or set pause_status: PAUSED if you need to stop scrapes.
+# Uses serverless Python so Lakebase is reachable on IP-ACL workspaces (classic
+# cluster egress is often blocked). For Private Link customer hubs where classic
+# VNet is required for spoke APIs *and* Lakebase is reachable from that VNet,
+# replace environment_key with a classic job_cluster (Standard_DS3_v2).
 resources:
   jobs:
     cluster_monitor_snapshot:
       name: cluster-monitor-snapshot
       description: >
-        Classic-compute scraper: lists clusters, warehouses, pipelines, and
-        job runs across all configured workspaces and writes snapshots to
-        Lakebase every 5 minutes for the read-only App UI.
+        Scraper: lists clusters, warehouses, pipelines, and job runs across
+        configured workspaces and writes Lakebase snapshots for the read-only App.
 
       schedule:
         quartz_cron_expression: "0 */5 * * * ?"
         timezone_id: "UTC"
         pause_status: UNPAUSED
 
-      job_clusters:
-        - job_cluster_key: snapshot_cluster
-          new_cluster:
-            # Single-node classic cluster — required for approved VNet / Private Link paths
-            spark_version: "15.4.x-scala2.12"
-            node_type_id: Standard_DS3_v2
-            num_workers: 0
-            driver_node_type_id: Standard_DS3_v2
-            data_security_mode: SINGLE_USER
-            spark_conf:
-              spark.databricks.cluster.profile: singleNode
-              spark.master: "local[*]"
-            custom_tags:
-              ResourceClass: SingleNode
-              cluster_monitor_role: classic-scraper
-            spark_env_vars:
-              LAKEBASE_ENDPOINT:      "projects/cmon-${bundle.target}/branches/production/endpoints/primary"
-              LAKEBASE_DATABASE_NAME: "databricks_postgres"
-              WORKSPACE_CONFIGS:      "${var.workspace_configs}"
-              SNAPSHOT_FILE_PATH:     "${var.snapshot_file_path}"
+      environments:
+        - environment_key: scrape_env
+          spec:
+            client: "2"
+            dependencies:
+              - psycopg[binary]>=3.0
+              - databricks-sdk>=0.81.0
+              - cryptography>=42.0.0
 
       tasks:
         - task_key: snapshot
-          job_cluster_key: snapshot_cluster
+          environment_key: scrape_env
           spark_python_task:
             python_file: ../snapshot_job.py
-          libraries:
-            - pypi:
-                package: psycopg[binary]>=3.0
-            - pypi:
-                package: databricks-sdk>=0.81.0
-            - pypi:
-                package: cryptography>=42.0.0
+            parameters:
+              - "--lakebase-endpoint=projects/cmon-${bundle.target}/branches/production/endpoints/primary"
+              - "--lakebase-database=databricks_postgres"
 
       email_notifications:
         on_failure:

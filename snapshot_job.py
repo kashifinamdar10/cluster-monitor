@@ -47,6 +47,27 @@ from api.settings import (
 from backend import LakebaseBackend, JsonFileBackend
 
 
+def _apply_cli_overrides() -> None:
+    """Apply --lakebase-endpoint / --lakebase-database from spark_python_task parameters."""
+    args = sys.argv[1:]
+    for i, arg in enumerate(args):
+        if arg.startswith("--lakebase-endpoint="):
+            os.environ["LAKEBASE_ENDPOINT"] = arg.split("=", 1)[1].strip()
+        elif arg == "--lakebase-endpoint" and i + 1 < len(args):
+            os.environ["LAKEBASE_ENDPOINT"] = args[i + 1].strip()
+        elif arg.startswith("--lakebase-database="):
+            os.environ["LAKEBASE_DATABASE_NAME"] = arg.split("=", 1)[1].strip()
+        elif arg == "--lakebase-database" and i + 1 < len(args):
+            os.environ["LAKEBASE_DATABASE_NAME"] = args[i + 1].strip()
+
+    # Bundle default when nothing injected (dev hub deploy)
+    os.environ.setdefault(
+        "LAKEBASE_ENDPOINT",
+        "projects/cmon-dev/branches/production/endpoints/primary",
+    )
+    os.environ.setdefault("LAKEBASE_DATABASE_NAME", "databricks_postgres")
+
+
 def _load_runtime_settings(backend) -> AppSettings:
     """Prefer Lakebase app_settings (UI-managed); fall back to disk/env."""
     settings = load_settings()
@@ -78,8 +99,11 @@ def _load_runtime_settings(backend) -> AppSettings:
 
 
 def main() -> None:
+    _apply_cli_overrides()
+    print(f"LAKEBASE_ENDPOINT={os.getenv('LAKEBASE_ENDPOINT')}")
+
     # Initialize backend first so we can load settings from Lakebase.
-    # Endpoint may come from spark_env_vars before settings.json exists.
+    # Endpoint may come from spark_env_vars / CLI params before settings.json exists.
     if os.getenv("LAKEBASE_ENDPOINT") or os.getenv("LAKEBASE_PG_URL"):
         backend: LakebaseBackend | JsonFileBackend = LakebaseBackend()
     else:

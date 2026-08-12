@@ -83,8 +83,18 @@ class LakebaseBackend:
             self._create_schema()
         except Exception as e:
             print(f"WARNING: Lakebase schema creation failed: {e}")
-            print("History will be unavailable until the schema issue is resolved.")
-            return
+            # App SP usually owns the tables; classic/serverless jobs may lack DDL rights.
+            # If DML works, continue — the App migration path creates scrape_run_id / scrape_runs.
+            try:
+                with self._get_conn() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "SELECT 1 FROM cluster_monitor.resource_snapshots LIMIT 1"
+                        )
+                print("Lakebase: existing schema is readable — continuing without DDL")
+            except Exception as probe_exc:
+                print(f"History will be unavailable until the schema issue is resolved. ({probe_exc})")
+                return
 
         self._initialized = True
         print(f"Lakebase backend ready (endpoint: {endpoint or 'local'})")
@@ -465,8 +475,7 @@ class LakebaseBackend:
                         cluster_source  VARCHAR(50),
                         creator         VARCHAR(255),
                         tags            JSONB DEFAULT '{}',
-                        metadata        JSONB DEFAULT '{}',
-                        scrape_run_id   VARCHAR(64)
+                        metadata        JSONB DEFAULT '{}'
                     );
 
                     CREATE INDEX IF NOT EXISTS idx_snapshots_time
@@ -475,13 +484,15 @@ class LakebaseBackend:
                         ON cluster_monitor.resource_snapshots (resource_type, resource_id);
                     CREATE INDEX IF NOT EXISTS idx_snapshots_state
                         ON cluster_monitor.resource_snapshots (state);
-                    CREATE INDEX IF NOT EXISTS idx_snapshots_scrape_run
-                        ON cluster_monitor.resource_snapshots (scrape_run_id);
                 """)
-                # Existing deployments may pre-date scrape_run_id — add if missing.
+                # Existing deployments may pre-date scrape_run_id — add before indexing.
                 cur.execute("""
                     ALTER TABLE cluster_monitor.resource_snapshots
                     ADD COLUMN IF NOT EXISTS scrape_run_id VARCHAR(64)
+                """)
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_snapshots_scrape_run
+                        ON cluster_monitor.resource_snapshots (scrape_run_id)
                 """)
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS cluster_monitor.scrape_runs (
@@ -501,6 +512,13 @@ class LakebaseBackend:
                         updated_at  TIMESTAMPTZ DEFAULT NOW(),
                         CONSTRAINT  single_row CHECK (id = 1)
                     )
+                """)
+                # Allow the classic/serverless scrape job (workspace user / job identity)
+                # to INSERT snapshots even when the App SP owns the tables.
+                cur.execute("""
+                    GRANT USAGE ON SCHEMA cluster_monitor TO PUBLIC;
+                    GRANT SELECT, INSERT, UPDATE ON ALL TABLES IN SCHEMA cluster_monitor TO PUBLIC;
+                    GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA cluster_monitor TO PUBLIC;
                 """)
             conn.commit()
 
