@@ -1,24 +1,40 @@
-# Scrape job — sole multi-workspace writer for Cluster Monitor.
+# Two-task scrape job for Private Link / IP-ACL hubs:
 #
-# Uses serverless Python so Lakebase is reachable on IP-ACL workspaces (classic
-# cluster egress is often blocked). For Private Link customer hubs where classic
-# VNet is required for spoke APIs *and* Lakebase is reachable from that VNet,
-# replace environment_key with a classic job_cluster (Standard_DS3_v2).
+#   scrape  — classic single-node job cluster (VNet egress → other workspace APIs)
+#             writes staging JSON to a UC Volume
+#   sync    — serverless Python (reaches Lakebase) reads staging → Lakebase
+#
+# Both tasks must share SNAPSHOT_STAGING_PATH. App should use the same path so
+# Settings saves can seed <staging>/app_settings.json for the classic scrape.
 resources:
   jobs:
     cluster_monitor_snapshot:
       name: cluster-monitor-snapshot
       description: >
-        Scraper: lists clusters, warehouses, pipelines, and job runs across
-        configured workspaces and writes Lakebase snapshots for the read-only App.
+        Classic scrape (multi-workspace REST/SDK) → Volume staging → serverless
+        Lakebase sync for the read-only App UI.
 
       schedule:
         quartz_cron_expression: "0 */5 * * * ?"
         timezone_id: "UTC"
         pause_status: UNPAUSED
 
+      job_clusters:
+        - job_cluster_key: scrape_classic
+          new_cluster:
+            cluster_name: ""
+            spark_version: "15.4.x-scala2.12"
+            node_type_id: Standard_DS3_v2
+            num_workers: 0
+            spark_conf:
+              spark.master: "local[*]"
+              spark.databricks.cluster.profile: singleNode
+            custom_tags:
+              ResourceClass: SingleNode
+            data_security_mode: SINGLE_USER
+
       environments:
-        - environment_key: scrape_env
+        - environment_key: sync_env
           spec:
             client: "2"
             dependencies:
@@ -27,11 +43,27 @@ resources:
               - cryptography>=42.0.0
 
       tasks:
-        - task_key: snapshot
-          environment_key: scrape_env
+        - task_key: scrape
+          job_cluster_key: scrape_classic
           spark_python_task:
-            python_file: ../snapshot_job.py
+            python_file: ../snapshot_scrape.py
             parameters:
+              # UC Volume both tasks (and ideally the App) can read/write
+              - "--staging-path=/Volumes/main/cluster_monitor/staging"
+          libraries:
+            - pypi:
+                package: databricks-sdk>=0.81.0
+            - pypi:
+                package: cryptography>=42.0.0
+
+        - task_key: sync
+          depends_on:
+            - task_key: scrape
+          environment_key: sync_env
+          spark_python_task:
+            python_file: ../snapshot_sync.py
+            parameters:
+              - "--staging-path=/Volumes/main/cluster_monitor/staging"
               - "--lakebase-endpoint=projects/cmon-${bundle.target}/branches/production/endpoints/primary"
               - "--lakebase-database=databricks_postgres"
               - "--lakebase-schema=cluster_monitor_v2"

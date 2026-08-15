@@ -14,6 +14,12 @@ env:
   - name: LAKEBASE_SCHEMA
     value: "cluster_monitor_v2"
 
+  # Shared Volume path for classic scrape ↔ serverless Lakebase sync handoff.
+  # Create the Volume first; App Settings saves also write app_settings.json here
+  # so the classic scrape task can load workspaces/account SP without Lakebase.
+  - name: SNAPSHOT_STAGING_PATH
+    value: "/Volumes/main/cluster_monitor/staging"
+
   # Deployment target injected by DABs — used by frontend to show the dev banner
   - name: BUNDLE_TARGET
     value: "${bundle.target}"

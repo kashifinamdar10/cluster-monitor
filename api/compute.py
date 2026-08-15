@@ -26,6 +26,29 @@ NON_INTERACTIVE_SOURCES = {"JOB", "PIPELINE"}
 # Larger values mean fewer round-trips; smaller values give more granular progress updates.
 _PAGE_SIZE_HINT = 50
 
+# Per-workspace fetch failures (cert validation, private-link, auth, ...).
+# Recorded instead of being written as fake "Error: ..." resources so a partial
+# scrape never looks like real inventory in Lakebase.
+_scrape_errors: list[dict] = []
+_scrape_errors_lock = threading.Lock()
+
+
+def reset_scrape_errors() -> None:
+    with _scrape_errors_lock:
+        _scrape_errors.clear()
+
+
+def get_scrape_errors() -> list[dict]:
+    with _scrape_errors_lock:
+        return list(_scrape_errors)
+
+
+def _record_scrape_error(phase: str, ws_name: str, exc: Exception) -> None:
+    message = str(exc)
+    with _scrape_errors_lock:
+        _scrape_errors.append({"phase": phase, "workspace": ws_name, "message": message})
+    print(f"  ! {phase} failed for {ws_name}: {message}", file=sys.stderr)
+
 
 # ---------------------------------------------------------------------------
 # Workspace client factory
@@ -259,14 +282,7 @@ def fetch_clusters() -> list[dict]:
             for c in client.clusters.list():
                 rows.append(_build_cluster(c, ws_name))
         except Exception as e:
-            rows.append({
-                "workspace": ws_name, "name": f"Error: {e}", "id": "",
-                "state": "ERROR", "state_message": str(e), "termination_code": "",
-                "termination_type": "", "creator": "", "spark_version": "",
-                "node_type": "", "num_workers": "", "cluster_source": "UNKNOWN",
-                "is_job_cluster": False, "is_pipeline_cluster": False,
-                "tags": {}, "tag_str": "",
-            })
+            _record_scrape_error("clusters", ws_name, e)
     return rows
 
 
@@ -277,11 +293,7 @@ def fetch_warehouses() -> list[dict]:
             for wh in client.warehouses.list():
                 rows.append(_build_warehouse(wh, ws_name))
         except Exception as e:
-            rows.append({
-                "workspace": ws_name, "name": f"Error: {e}", "id": "",
-                "state": "ERROR", "creator": "", "size": "", "type": "",
-                "auto_stop_mins": "", "tags": {}, "tag_str": "",
-            })
+            _record_scrape_error("warehouses", ws_name, e)
     return rows
 
 
@@ -292,11 +304,7 @@ def fetch_pipelines() -> list[dict]:
             for p in client.pipelines.list_pipelines():
                 rows.append(_build_pipeline(p, ws_name))
         except Exception as e:
-            rows.append({
-                "workspace": ws_name, "name": f"Error: {e}", "id": "",
-                "state": "ERROR", "creator": "", "cluster_id": "",
-                "latest_updates": [],
-            })
+            _record_scrape_error("pipelines", ws_name, e)
     return rows
 
 
@@ -308,12 +316,7 @@ def fetch_job_runs() -> list[dict]:
             for r in client.jobs.list_runs(active_only=True, expand_tasks=False):
                 rows.append(_build_job_run(r, ws_name))
         except Exception as e:
-            rows.append({
-                "workspace": ws_name, "run_id": "", "job_id": "",
-                "run_name": f"Error: {e}", "state": "ERROR",
-                "result_state": "", "start_time_ms": 0, "duration_ms": 0,
-                "trigger": "", "run_type": "",
-            })
+            _record_scrape_error("job_runs", ws_name, e)
     return rows
 
 

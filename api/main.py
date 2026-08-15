@@ -318,6 +318,16 @@ def put_settings(payload: SettingsPayload):
             print(f"ERROR: {msg}", file=sys.stderr)
             return JSONResponse(status_code=500, content={"saved": False, "error": msg})
 
+    # Seed Volume cache so the classic scrape task can load workspaces/SP
+    # without connecting to Lakebase.
+    if os.getenv("SNAPSHOT_STAGING_PATH"):
+        try:
+            import snapshot_common as _staging
+            _staging.write_settings_cache(new_settings.to_disk_dict())
+            print(f"Settings cache written under {os.getenv('SNAPSHOT_STAGING_PATH')}")
+        except Exception as exc:
+            print(f"WARNING: could not write scrape settings cache: {exc}", file=sys.stderr)
+
     _current_settings = new_settings
     set_current_settings(_current_settings)
     try:

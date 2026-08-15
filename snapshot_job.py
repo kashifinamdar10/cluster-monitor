@@ -1,18 +1,12 @@
-"""Classic-compute scrape job: sole multi-workspace writer for Cluster Monitor.
+"""Legacy single-process entrypoint (hub-only / Lakebase-reachable compute).
 
-Runs on a classic single-node job cluster (VNet / Private Link friendly) and
-writes compute snapshots into Lakebase. The Databricks App UI is read-only and
-serves tables from these snapshots.
+Prefer the two-task job:
+  snapshot_scrape.py  — classic job compute → Volume staging
+  snapshot_sync.py    — serverless → Lakebase
 
-Environment variables (injected by the Databricks Job runtime):
-  LAKEBASE_ENDPOINT      — full endpoint resource name (same workspace as job)
-  LAKEBASE_DATABASE_NAME — target database (default: databricks_postgres)
-  LAKEBASE_SCHEMA        — Postgres schema (default: cluster_monitor)
-  SNAPSHOT_FILE_PATH     — JSONL Volume path, used when Lakebase is not set
-  WORKSPACE_CONFIGS      — optional JSON array of extra workspace configs (legacy)
-
-Workspace list + account SP are loaded from Lakebase app_settings (written by
-the Settings UI), with disk/env settings.json as fallback.
+Running this file alone still scrapes and writes Lakebase directly (previous
+behaviour). Use it only when one compute type can reach both spoke APIs and
+Lakebase.
 """
 from __future__ import annotations
 
@@ -21,25 +15,19 @@ import sys
 import uuid
 from datetime import datetime, timezone
 
-# Ensure project root is on sys.path so api.* and backend can be imported.
-#
-# spark_python_task runs scripts via exec(compile(f.read(), filename, 'exec')),
-# which does NOT set __file__.  Fall back to the frame's co_filename, which IS
-# populated from the compile() call with the workspace path of the script.
-try:
-    _script_dir = os.path.dirname(os.path.abspath(__file__))
-except NameError:
-    import inspect as _inspect
-    _frame = _inspect.currentframe()
-    _script_dir = os.path.dirname(os.path.abspath(
-        _frame.f_code.co_filename if _frame else sys.argv[0]
-    ))
-    del _inspect, _frame
+import snapshot_common as common
 
-sys.path.insert(0, _script_dir)
-del _script_dir
+common.ensure_project_path()
+common.apply_cli_overrides()
 
-from api.compute import fetch_clusters, fetch_warehouses, fetch_pipelines, fetch_job_runs
+from api.compute import (
+    fetch_clusters,
+    fetch_warehouses,
+    fetch_pipelines,
+    fetch_job_runs,
+    get_scrape_errors,
+    reset_scrape_errors,
+)
 from api.settings import (
     AppSettings,
     load_settings,
@@ -48,34 +36,7 @@ from api.settings import (
 from backend import LakebaseBackend, JsonFileBackend
 
 
-def _apply_cli_overrides() -> None:
-    """Apply --lakebase-* flags from spark_python_task parameters."""
-    args = sys.argv[1:]
-    for i, arg in enumerate(args):
-        if arg.startswith("--lakebase-endpoint="):
-            os.environ["LAKEBASE_ENDPOINT"] = arg.split("=", 1)[1].strip()
-        elif arg == "--lakebase-endpoint" and i + 1 < len(args):
-            os.environ["LAKEBASE_ENDPOINT"] = args[i + 1].strip()
-        elif arg.startswith("--lakebase-database="):
-            os.environ["LAKEBASE_DATABASE_NAME"] = arg.split("=", 1)[1].strip()
-        elif arg == "--lakebase-database" and i + 1 < len(args):
-            os.environ["LAKEBASE_DATABASE_NAME"] = args[i + 1].strip()
-        elif arg.startswith("--lakebase-schema="):
-            os.environ["LAKEBASE_SCHEMA"] = arg.split("=", 1)[1].strip()
-        elif arg == "--lakebase-schema" and i + 1 < len(args):
-            os.environ["LAKEBASE_SCHEMA"] = args[i + 1].strip()
-
-    # Bundle default when nothing injected (dev hub deploy)
-    os.environ.setdefault(
-        "LAKEBASE_ENDPOINT",
-        "projects/cmon-dev/branches/production/endpoints/primary",
-    )
-    os.environ.setdefault("LAKEBASE_DATABASE_NAME", "databricks_postgres")
-    os.environ.setdefault("LAKEBASE_SCHEMA", "cluster_monitor")
-
-
 def _load_runtime_settings(backend) -> AppSettings:
-    """Prefer Lakebase app_settings (UI-managed); fall back to disk/env."""
     settings = load_settings()
 
     if isinstance(backend, LakebaseBackend) and backend.is_available:
@@ -94,7 +55,6 @@ def _load_runtime_settings(backend) -> AppSettings:
                     file=sys.stderr,
                 )
 
-    # Env endpoint wins when settings file has empty lakebase (Apps inject this).
     if not settings.lakebase.endpoint and os.getenv("LAKEBASE_ENDPOINT"):
         settings.lakebase.endpoint = os.getenv("LAKEBASE_ENDPOINT", "")
     if os.getenv("LAKEBASE_DATABASE_NAME"):
@@ -105,23 +65,19 @@ def _load_runtime_settings(backend) -> AppSettings:
 
 
 def main() -> None:
-    _apply_cli_overrides()
+    print(
+        "WARNING: snapshot_job.py is the legacy single-task path. "
+        "Prefer scrape (classic) + sync (serverless) tasks.",
+        file=sys.stderr,
+    )
     print(f"LAKEBASE_ENDPOINT={os.getenv('LAKEBASE_ENDPOINT')}")
     print(f"LAKEBASE_SCHEMA={os.getenv('LAKEBASE_SCHEMA', 'cluster_monitor')}")
-    try:
-        from databricks.sdk.version import __version__ as _sdk_version
-        print(f"databricks-sdk={_sdk_version}")
-    except Exception:
-        pass
 
-    # Initialize backend first so we can load settings from Lakebase.
-    # Endpoint may come from spark_env_vars / CLI params before settings.json exists.
     if os.getenv("LAKEBASE_ENDPOINT") or os.getenv("LAKEBASE_PG_URL"):
         backend: LakebaseBackend | JsonFileBackend = LakebaseBackend()
     else:
         disk = load_settings()
         if disk.lakebase.endpoint:
-            # Ensure env is set for LakebaseBackend module-level config
             os.environ.setdefault("LAKEBASE_ENDPOINT", disk.lakebase.endpoint)
             os.environ.setdefault(
                 "LAKEBASE_DATABASE_NAME",
@@ -139,20 +95,17 @@ def main() -> None:
 
     backend.initialize()
     if not backend.is_available:
-        print("History backend failed to initialise — exiting.", file=sys.stderr)
         raise RuntimeError("History backend failed to initialise")
 
     settings = _load_runtime_settings(backend)
     enabled = [w for w in settings.workspaces if w.enabled]
-    print(
-        f"Starting classic scrape — "
-        f"{len(enabled) or 'default'} enabled workspace(s)"
-    )
+    print(f"Starting scrape — {len(enabled) or 'default'} enabled workspace(s)")
 
     run_id = f"scrape-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:8]}"
     backend.begin_scrape_run(run_id)
     print(f"scrape_run_id={run_id}")
 
+    reset_scrape_errors()
     results: dict[str, int] = {}
     errors: list[str] = []
 
@@ -171,19 +124,13 @@ def main() -> None:
             errors.append(f"{label}: {exc}")
             print(f"  ✗ {label}: {exc}", file=sys.stderr)
 
-    total = sum(results.values())
-    print(f"\nSnapshot complete — {total} records across {len(results)} resource types")
+    for err in get_scrape_errors():
+        errors.append(f"{err['phase']}@{err['workspace']}: {err['message']}")
 
     if errors:
         backend.complete_scrape_run(
-            run_id,
-            status="failed",
-            counts=results,
-            error="; ".join(errors),
+            run_id, status="failed", counts=results, error="; ".join(errors),
         )
-        print(f"\n{len(errors)} error(s):")
-        for e in errors:
-            print(f"  - {e}", file=sys.stderr)
         raise RuntimeError(f"{len(errors)} snapshot error(s): {'; '.join(errors)}")
 
     backend.complete_scrape_run(run_id, status="completed", counts=results)
