@@ -70,6 +70,14 @@ def _sql(sql: str) -> str:
     return sql.replace("{schema}", _lakebase_schema())
 
 
+def _clip(value: object, max_len: int) -> str:
+    """Coerce to str and truncate so INSERT never exceeds VARCHAR limits."""
+    s = "" if value is None else str(value)
+    if len(s) <= max_len:
+        return s
+    return s[: max_len - 1] + "…"
+
+
 # ── Lakebase control-plane calls ──────────────────────────────────────────────
 # Databricks Runtime ships its own (often older) databricks-sdk that predates
 # w.postgres. Fall back to the same REST endpoints through the generic API
@@ -246,30 +254,38 @@ class LakebaseBackend:
             return
 
         now = datetime.utcnow()
-        rows = [
-            (
+        # Clip to current column widths so long job/pipeline names (common with
+        # multi-workspace scrapes) do not fail VARCHAR(500) inserts. Full values
+        # remain in the JSONB metadata payload below.
+        rows = []
+        for r in resources:
+            full_id = r.get("id") or r.get("run_id", "")
+            full_name = r.get("name") or r.get("run_name", "")
+            meta = {
+                k: v for k, v in r.items()
+                if k not in (
+                    "id", "name", "workspace", "state",
+                    "cluster_source", "creator", "tags", "tag_str",
+                    "is_job_cluster", "is_pipeline_cluster",
+                )
+            }
+            if len(str(full_name)) > 500:
+                meta["full_name"] = full_name
+            if len(str(full_id)) > 255:
+                meta["full_id"] = full_id
+            rows.append((
                 now,
                 resource_type,
-                # job_run uses run_id/run_name; every other type uses id/name
-                r.get("id") or r.get("run_id", ""),
-                r.get("name") or r.get("run_name", ""),
-                r.get("workspace", ""),
-                r.get("state", ""),
-                r.get("cluster_source", ""),
-                r.get("creator", ""),
+                _clip(full_id, 255),
+                _clip(full_name, 500),
+                _clip(r.get("workspace", ""), 255),
+                _clip(r.get("state", ""), 50),
+                _clip(r.get("cluster_source", ""), 50),
+                _clip(r.get("creator", ""), 255),
                 json.dumps(r.get("tags", {})),
-                json.dumps({
-                    k: v for k, v in r.items()
-                    if k not in (
-                        "id", "name", "workspace", "state",
-                        "cluster_source", "creator", "tags", "tag_str",
-                        "is_job_cluster", "is_pipeline_cluster",
-                    )
-                }),
-                run_id,
-            )
-            for r in resources
-        ]
+                json.dumps(meta),
+                _clip(run_id, 64) if run_id else None,
+            ))
 
         with self._get_conn() as conn:
             with conn.cursor() as cur:
@@ -523,12 +539,12 @@ class LakebaseBackend:
                         id              SERIAL PRIMARY KEY,
                         snapshot_time   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                         resource_type   VARCHAR(20)  NOT NULL,
-                        resource_id     VARCHAR(255) NOT NULL,
-                        resource_name   VARCHAR(500),
-                        workspace       VARCHAR(255),
+                        resource_id     TEXT NOT NULL,
+                        resource_name   TEXT,
+                        workspace       TEXT,
                         state           VARCHAR(50),
                         cluster_source  VARCHAR(50),
-                        creator         VARCHAR(255),
+                        creator         TEXT,
                         tags            JSONB DEFAULT '{}',
                         metadata        JSONB DEFAULT '{}'
                     );
