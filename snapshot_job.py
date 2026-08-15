@@ -7,6 +7,7 @@ serves tables from these snapshots.
 Environment variables (injected by the Databricks Job runtime):
   LAKEBASE_ENDPOINT      — full endpoint resource name (same workspace as job)
   LAKEBASE_DATABASE_NAME — target database (default: databricks_postgres)
+  LAKEBASE_SCHEMA        — Postgres schema (default: cluster_monitor)
   SNAPSHOT_FILE_PATH     — JSONL Volume path, used when Lakebase is not set
   WORKSPACE_CONFIGS      — optional JSON array of extra workspace configs (legacy)
 
@@ -48,7 +49,7 @@ from backend import LakebaseBackend, JsonFileBackend
 
 
 def _apply_cli_overrides() -> None:
-    """Apply --lakebase-endpoint / --lakebase-database from spark_python_task parameters."""
+    """Apply --lakebase-* flags from spark_python_task parameters."""
     args = sys.argv[1:]
     for i, arg in enumerate(args):
         if arg.startswith("--lakebase-endpoint="):
@@ -59,6 +60,10 @@ def _apply_cli_overrides() -> None:
             os.environ["LAKEBASE_DATABASE_NAME"] = arg.split("=", 1)[1].strip()
         elif arg == "--lakebase-database" and i + 1 < len(args):
             os.environ["LAKEBASE_DATABASE_NAME"] = args[i + 1].strip()
+        elif arg.startswith("--lakebase-schema="):
+            os.environ["LAKEBASE_SCHEMA"] = arg.split("=", 1)[1].strip()
+        elif arg == "--lakebase-schema" and i + 1 < len(args):
+            os.environ["LAKEBASE_SCHEMA"] = args[i + 1].strip()
 
     # Bundle default when nothing injected (dev hub deploy)
     os.environ.setdefault(
@@ -66,6 +71,7 @@ def _apply_cli_overrides() -> None:
         "projects/cmon-dev/branches/production/endpoints/primary",
     )
     os.environ.setdefault("LAKEBASE_DATABASE_NAME", "databricks_postgres")
+    os.environ.setdefault("LAKEBASE_SCHEMA", "cluster_monitor")
 
 
 def _load_runtime_settings(backend) -> AppSettings:
@@ -101,6 +107,12 @@ def _load_runtime_settings(backend) -> AppSettings:
 def main() -> None:
     _apply_cli_overrides()
     print(f"LAKEBASE_ENDPOINT={os.getenv('LAKEBASE_ENDPOINT')}")
+    print(f"LAKEBASE_SCHEMA={os.getenv('LAKEBASE_SCHEMA', 'cluster_monitor')}")
+    try:
+        from databricks.sdk.version import __version__ as _sdk_version
+        print(f"databricks-sdk={_sdk_version}")
+    except Exception:
+        pass
 
     # Initialize backend first so we can load settings from Lakebase.
     # Endpoint may come from spark_env_vars / CLI params before settings.json exists.

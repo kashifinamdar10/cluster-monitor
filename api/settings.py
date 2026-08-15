@@ -228,13 +228,14 @@ def test_lakebase(endpoint: str, database: str) -> dict:
         from databricks.sdk import WorkspaceClient
         import psycopg
 
+        from backend import _pg_credential_token, _pg_endpoint_host
+
         w = WorkspaceClient()
         t0 = time.perf_counter()
 
-        ep = w.postgres.get_endpoint(name=endpoint)
-        host = ep.status.hosts.host
+        host = _pg_endpoint_host(w, endpoint)
         username = w.current_user.me().user_name
-        token = w.postgres.generate_database_credential(endpoint=endpoint).token
+        token = _pg_credential_token(w, endpoint)
 
         conn_str = (
             f"host={host} dbname={database} "

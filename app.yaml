@@ -9,6 +9,10 @@ env:
     valueFrom: postgres
   - name: LAKEBASE_DATABASE_NAME
     value: "databricks_postgres"
+  # Postgres schema for snapshots (change for v2 side-by-side with an older App).
+  # Must match the scrape job --lakebase-schema / LAKEBASE_SCHEMA.
+  - name: LAKEBASE_SCHEMA
+    value: "cluster_monitor_v2"
 
   # Deployment target injected by DABs — used by frontend to show the dev banner
   - name: BUNDLE_TARGET

@@ -34,6 +34,7 @@ resources:
             parameters:
               - "--lakebase-endpoint=projects/cmon-${bundle.target}/branches/production/endpoints/primary"
               - "--lakebase-database=databricks_postgres"
+              - "--lakebase-schema=cluster_monitor_v2"
 
       email_notifications:
         on_failure:

@@ -757,6 +757,7 @@ def health():
         "bundle_target":       os.getenv("BUNDLE_TARGET", ""),
         "workspace_host":      workspace_host.rstrip("/"),
         "lakebase_project_id": lakebase_project_id,
+        "lakebase_schema":     os.getenv("LAKEBASE_SCHEMA", "cluster_monitor"),
         "snapshot_job_name":   os.getenv("SNAPSHOT_JOB_NAME", "cluster-monitor-snapshot"),
     }
 

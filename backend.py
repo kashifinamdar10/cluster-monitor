@@ -4,7 +4,9 @@ Two backends are available; the app uses whichever is configured:
 
 LakebaseBackend  -- autoscaling Lakebase project via w.postgres OAuth.
   Auth uses the running identity (app SP or dev user); requires LAKEBASE_ENDPOINT
-  env var or settings.json. Token is refreshed every 50 min in a background thread.
+  env var or settings.json. Schema defaults to cluster_monitor; override with
+  LAKEBASE_SCHEMA (e.g. cluster_monitor_v2) for side-by-side App versions.
+  Token is refreshed every 50 min in a background thread.
 
 JsonFileBackend  -- appends JSONL to any writable path.
   Works with Databricks Volumes (/Volumes/...), /tmp, or a local dev path.
@@ -16,6 +18,7 @@ Connection priority:
 """
 import os
 import json
+import re
 import threading
 import time
 from datetime import datetime, timedelta
@@ -40,8 +43,59 @@ def _lakebase_database() -> str:
     return os.getenv("LAKEBASE_DATABASE_NAME", "databricks_postgres")
 
 
+def _lakebase_schema() -> str:
+    """Postgres schema for snapshots/settings (LAKEBASE_SCHEMA, default cluster_monitor).
+
+    Use a distinct value (e.g. cluster_monitor_v2) when a prior App SP owns the
+    default schema and the new App must create its own tables.
+    """
+    raw = (os.getenv("LAKEBASE_SCHEMA") or "cluster_monitor").strip()
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", raw):
+        raise ValueError(
+            f"Invalid LAKEBASE_SCHEMA={raw!r} — use letters, digits, underscore only"
+        )
+    return raw
+
+
 def _lakebase_pg_url() -> str:
     return os.getenv("LAKEBASE_PG_URL", "")
+
+
+def _sql(sql: str) -> str:
+    """Substitute the configured Lakebase schema into SQL templates.
+
+    Templates use ``{schema}`` placeholders. Safe with psycopg ``%s`` params
+    (unlike str.format).
+    """
+    return sql.replace("{schema}", _lakebase_schema())
+
+
+# ── Lakebase control-plane calls ──────────────────────────────────────────────
+# Databricks Runtime ships its own (often older) databricks-sdk that predates
+# w.postgres. Fall back to the same REST endpoints through the generic API
+# client so the scrape job runs on any runtime without a library upgrade.
+
+def _pg_endpoint_host(w: WorkspaceClient, name: str) -> str:
+    if hasattr(w, "postgres"):
+        return w.postgres.get_endpoint(name=name).status.hosts.host
+    res = w.api_client.do("GET", f"/api/2.0/postgres/{name}")
+    host = ((res or {}).get("status") or {}).get("hosts", {}).get("host")
+    if not host:
+        raise RuntimeError(
+            f"Lakebase endpoint '{name}' returned no host — check the endpoint "
+            f"exists and the identity has CAN_USE on the project. Response: {res}"
+        )
+    return host
+
+
+def _pg_credential_token(w: WorkspaceClient, name: str) -> str:
+    if hasattr(w, "postgres"):
+        return w.postgres.generate_database_credential(endpoint=name).token
+    res = w.api_client.do("POST", "/api/2.0/postgres/credentials", body={"endpoint": name})
+    token = (res or {}).get("token")
+    if not token:
+        raise RuntimeError(f"Lakebase credential request returned no token: {res}")
+    return token
 
 
 class LakebaseBackend:
@@ -89,7 +143,7 @@ class LakebaseBackend:
                 with self._get_conn() as conn:
                     with conn.cursor() as cur:
                         cur.execute(
-                            "SELECT 1 FROM cluster_monitor.resource_snapshots LIMIT 1"
+                            _sql("SELECT 1 FROM {schema}.resource_snapshots LIMIT 1")
                         )
                 print("Lakebase: existing schema is readable — continuing without DDL")
             except Exception as probe_exc:
@@ -97,7 +151,7 @@ class LakebaseBackend:
                 return
 
         self._initialized = True
-        print(f"Lakebase backend ready (endpoint: {endpoint or 'local'})")
+        print(f"Lakebase backend ready (endpoint: {endpoint or 'local'}, schema: {_lakebase_schema()})")
 
     @property
     def is_available(self) -> bool:
@@ -110,8 +164,8 @@ class LakebaseBackend:
         with self._get_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    """
-                    INSERT INTO cluster_monitor.scrape_runs
+                    _sql("""
+                    INSERT INTO {schema}.scrape_runs
                         (run_id, started_at, status, counts)
                     VALUES (%s, NOW(), 'running', '{}'::jsonb)
                     ON CONFLICT (run_id) DO UPDATE
@@ -120,7 +174,7 @@ class LakebaseBackend:
                             finished_at = NULL,
                             counts = '{}'::jsonb,
                             error = NULL
-                    """,
+                    """),
                     (run_id,),
                 )
             conn.commit()
@@ -139,14 +193,14 @@ class LakebaseBackend:
         with self._get_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    """
-                    UPDATE cluster_monitor.scrape_runs
+                    _sql("""
+                    UPDATE {schema}.scrape_runs
                     SET finished_at = NOW(),
                         status = %s,
                         counts = %s::jsonb,
                         error = %s
                     WHERE run_id = %s
-                    """,
+                    """),
                     (status, json.dumps(counts or {}), error, run_id),
                 )
             conn.commit()
@@ -158,24 +212,24 @@ class LakebaseBackend:
         with self._get_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    """
+                    _sql("""
                     SELECT run_id, started_at, finished_at, status, counts, error
-                    FROM cluster_monitor.scrape_runs
+                    FROM {schema}.scrape_runs
                     WHERE status = 'completed'
                     ORDER BY finished_at DESC NULLS LAST, started_at DESC
                     LIMIT 1
-                    """
+                    """)
                 )
                 row = cur.fetchone()
                 if row:
                     return dict(row)
                 cur.execute(
-                    """
+                    _sql("""
                     SELECT run_id, started_at, finished_at, status, counts, error
-                    FROM cluster_monitor.scrape_runs
+                    FROM {schema}.scrape_runs
                     ORDER BY started_at DESC
                     LIMIT 1
-                    """
+                    """)
                 )
                 row = cur.fetchone()
                 return dict(row) if row else None
@@ -220,13 +274,13 @@ class LakebaseBackend:
         with self._get_conn() as conn:
             with conn.cursor() as cur:
                 cur.executemany(
-                    """
-                    INSERT INTO cluster_monitor.resource_snapshots
+                    _sql("""
+                    INSERT INTO {schema}.resource_snapshots
                         (snapshot_time, resource_type, resource_id, resource_name,
                          workspace, state, cluster_source, creator, tags, metadata,
                          scrape_run_id)
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    """,
+                    """),
                     rows,
                 )
             conn.commit()
@@ -241,16 +295,16 @@ class LakebaseBackend:
             return []
 
         since = datetime.utcnow() - timedelta(hours=hours)
-        query = """
+        query = _sql("""
             WITH ranked AS (
                 SELECT *,
                     LAG(state) OVER (
                         PARTITION BY resource_type, resource_id
                         ORDER BY snapshot_time
                     ) AS prev_state
-                FROM cluster_monitor.resource_snapshots
+                FROM {schema}.resource_snapshots
                 WHERE snapshot_time > %s
-        """
+        """)
         params: list = [since]
         if resource_type:
             query += " AND resource_type = %s"
@@ -288,24 +342,26 @@ class LakebaseBackend:
         with self._get_conn() as conn:
             with conn.cursor() as cur:
                 if run_id:
-                    cur.execute("""
+                    cur.execute(
+                    _sql("""
                         SELECT DISTINCT ON (resource_type, resource_id)
                             resource_type, resource_id, resource_name, workspace, state,
                             cluster_source, creator, tags, metadata, snapshot_time,
                             scrape_run_id
-                        FROM cluster_monitor.resource_snapshots
+                        FROM {schema}.resource_snapshots
                         WHERE scrape_run_id = %s
                         ORDER BY resource_type, resource_id, snapshot_time DESC
-                    """, (run_id,))
+                    """), (run_id,))
                 else:
-                    cur.execute("""
+                    cur.execute(
+                    _sql("""
                         SELECT DISTINCT ON (resource_type, resource_id)
                             resource_type, resource_id, resource_name, workspace, state,
                             cluster_source, creator, tags, metadata, snapshot_time,
                             scrape_run_id
-                        FROM cluster_monitor.resource_snapshots
+                        FROM {schema}.resource_snapshots
                         ORDER BY resource_type, resource_id, snapshot_time DESC
-                    """)
+                    """))
                 rows = cur.fetchall()
 
         for row in rows:
@@ -368,13 +424,13 @@ class LakebaseBackend:
         with self._get_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    """
+                    _sql("""
                     SELECT snapshot_time, state, resource_name, workspace
-                    FROM cluster_monitor.resource_snapshots
+                    FROM {schema}.resource_snapshots
                     WHERE resource_id = %s AND snapshot_time > %s
                     ORDER BY snapshot_time DESC
                     LIMIT 500
-                    """,
+                    """),
                     (resource_id, since),
                 )
                 return cur.fetchall()
@@ -388,16 +444,16 @@ class LakebaseBackend:
         with self._get_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    """
+                    _sql("""
                     SELECT resource_type, resource_id, resource_name, workspace,
                            COUNT(*) AS total_snapshots,
                            SUM(CASE WHEN state = 'RUNNING' THEN 1 ELSE 0 END)
                                AS running_snapshots
-                    FROM cluster_monitor.resource_snapshots
+                    FROM {schema}.resource_snapshots
                     WHERE snapshot_time > %s
                     GROUP BY resource_type, resource_id, resource_name, workspace
                     ORDER BY running_snapshots DESC
-                    """,
+                    """),
                     (since,),
                 )
                 return cur.fetchall()
@@ -413,8 +469,7 @@ class LakebaseBackend:
     def _setup_oauth_connection(self) -> None:
         """Resolve endpoint host and generate first OAuth token."""
         w = WorkspaceClient()
-        endpoint = w.postgres.get_endpoint(name=_lakebase_endpoint())
-        self._host = endpoint.status.hosts.host
+        self._host = _pg_endpoint_host(w, _lakebase_endpoint())
         self._username = w.current_user.me().user_name
         self._token = self._generate_token(w)
         self._conn_string = self._build_conn_string()
@@ -424,8 +479,7 @@ class LakebaseBackend:
         """Generate a fresh OAuth database credential token."""
         if w is None:
             w = WorkspaceClient()
-        cred = w.postgres.generate_database_credential(endpoint=_lakebase_endpoint())
-        return cred.token
+        return _pg_credential_token(w, _lakebase_endpoint())
 
     def _build_conn_string(self) -> str:
         return (
@@ -457,14 +511,15 @@ class LakebaseBackend:
 
     def _create_schema(self) -> None:
         """Create the app's private schema (owned by the SP) and tables within it."""
+        schema = _lakebase_schema()
         with self._get_conn() as conn:
             with conn.cursor() as cur:
                 # Create a private schema — the SP will own it because it creates it.
                 # This avoids the 'permission denied for schema public' error.
-                cur.execute("CREATE SCHEMA IF NOT EXISTS cluster_monitor")
-                cur.execute("SET search_path TO cluster_monitor")
-                cur.execute("""
-                    CREATE TABLE IF NOT EXISTS resource_snapshots (
+                cur.execute(_sql("CREATE SCHEMA IF NOT EXISTS {schema}"))
+                cur.execute(_sql("SET search_path TO {schema}"))
+                cur.execute(_sql("""
+                    CREATE TABLE IF NOT EXISTS {schema}.resource_snapshots (
                         id              SERIAL PRIMARY KEY,
                         snapshot_time   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                         resource_type   VARCHAR(20)  NOT NULL,
@@ -479,23 +534,23 @@ class LakebaseBackend:
                     );
 
                     CREATE INDEX IF NOT EXISTS idx_snapshots_time
-                        ON cluster_monitor.resource_snapshots (snapshot_time DESC);
+                        ON {schema}.resource_snapshots (snapshot_time DESC);
                     CREATE INDEX IF NOT EXISTS idx_snapshots_resource
-                        ON cluster_monitor.resource_snapshots (resource_type, resource_id);
+                        ON {schema}.resource_snapshots (resource_type, resource_id);
                     CREATE INDEX IF NOT EXISTS idx_snapshots_state
-                        ON cluster_monitor.resource_snapshots (state);
-                """)
+                        ON {schema}.resource_snapshots (state);
+                """))
                 # Existing deployments may pre-date scrape_run_id — add before indexing.
-                cur.execute("""
-                    ALTER TABLE cluster_monitor.resource_snapshots
+                cur.execute(_sql("""
+                    ALTER TABLE {schema}.resource_snapshots
                     ADD COLUMN IF NOT EXISTS scrape_run_id VARCHAR(64)
-                """)
-                cur.execute("""
+                """))
+                cur.execute(_sql("""
                     CREATE INDEX IF NOT EXISTS idx_snapshots_scrape_run
-                        ON cluster_monitor.resource_snapshots (scrape_run_id)
-                """)
-                cur.execute("""
-                    CREATE TABLE IF NOT EXISTS cluster_monitor.scrape_runs (
+                        ON {schema}.resource_snapshots (scrape_run_id)
+                """))
+                cur.execute(_sql("""
+                    CREATE TABLE IF NOT EXISTS {schema}.scrape_runs (
                         run_id      VARCHAR(64) PRIMARY KEY,
                         started_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                         finished_at TIMESTAMPTZ,
@@ -503,24 +558,26 @@ class LakebaseBackend:
                         counts      JSONB DEFAULT '{}',
                         error       TEXT
                     )
-                """)
+                """))
                 # Singleton settings row — survives all deploys.
-                cur.execute("""
-                    CREATE TABLE IF NOT EXISTS cluster_monitor.app_settings (
+                cur.execute(_sql("""
+                    CREATE TABLE IF NOT EXISTS {schema}.app_settings (
                         id          INTEGER PRIMARY KEY DEFAULT 1,
                         data        JSONB    NOT NULL,
                         updated_at  TIMESTAMPTZ DEFAULT NOW(),
                         CONSTRAINT  single_row CHECK (id = 1)
                     )
-                """)
+                """))
                 # Allow the classic/serverless scrape job (workspace user / job identity)
                 # to INSERT snapshots even when the App SP owns the tables.
-                cur.execute("""
-                    GRANT USAGE ON SCHEMA cluster_monitor TO PUBLIC;
-                    GRANT SELECT, INSERT, UPDATE ON ALL TABLES IN SCHEMA cluster_monitor TO PUBLIC;
-                    GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA cluster_monitor TO PUBLIC;
-                """)
+                cur.execute(_sql("""
+                    GRANT USAGE ON SCHEMA {schema} TO PUBLIC;
+                    GRANT SELECT, INSERT, UPDATE ON ALL TABLES IN SCHEMA {schema} TO PUBLIC;
+                    GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA {schema} TO PUBLIC;
+                """))
             conn.commit()
+            print(f"Lakebase: ensured schema {schema!r} and tables")
+
 
     def load_app_settings(self) -> Optional[dict]:
         """Return the saved settings dict, or None if not yet written."""
@@ -530,7 +587,7 @@ class LakebaseBackend:
             with self._get_conn() as conn:
                 with conn.cursor() as cur:
                     cur.execute(
-                        "SELECT data FROM cluster_monitor.app_settings WHERE id = 1"
+                    _sql("SELECT data FROM {schema}.app_settings WHERE id = 1")
                     )
                     row = cur.fetchone()
                     return row["data"] if row else None
@@ -544,12 +601,12 @@ class LakebaseBackend:
         with self._get_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    """
-                    INSERT INTO cluster_monitor.app_settings (id, data, updated_at)
+                    _sql("""
+                    INSERT INTO {schema}.app_settings (id, data, updated_at)
                     VALUES (1, %s, NOW())
                     ON CONFLICT (id) DO UPDATE
                         SET data = EXCLUDED.data, updated_at = NOW()
-                    """,
+                    """),
                     (_json.dumps(d),),
                 )
             conn.commit()
