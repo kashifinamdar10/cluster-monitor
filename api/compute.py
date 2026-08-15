@@ -58,9 +58,9 @@ def get_workspace_clients() -> dict[str, WorkspaceClient]:
     """Return a {name: WorkspaceClient} dict for all enabled workspaces.
 
     Priority:
-      1. settings.json workspaces list (enabled entries only)
-         - Current workspace: uses default WorkspaceClient() (app SP auth)
-         - Other workspaces:  uses account_sp credentials from settings.json
+      1. settings workspaces list (enabled entries only)
+         - Current/hub workspace: default WorkspaceClient() (App SP or job run-as)
+         - Other (spoke) workspaces: account_sp credentials from settings
       2. WORKSPACE_CONFIGS env var (legacy)
       3. Default: current workspace only
     """
@@ -83,12 +83,15 @@ def get_workspace_clients() -> dict[str, WorkspaceClient]:
 
         for w in enabled_ws:
             ws_host    = w.host.rstrip("/")
-            is_current = ws_host == current_host
+            is_current = bool(w.current) or ws_host == current_host
 
-            if has_sp:
-                # Settings SP configured → use it for every workspace (including current).
-                # workspace_client_sp() suppresses the app SP env vars so the SDK only
-                # sees the settings credentials.
+            if is_current:
+                # Hub workspace: always use the running identity (App SP or job
+                # run-as). Account SP often is not (or cannot be) authenticated
+                # against the hub the same way and yields invalid_client.
+                clients[w.name] = _default
+            elif has_sp:
+                # Spoke workspaces: account-level SP for cross-workspace APIs.
                 try:
                     clients[w.name] = workspace_client_sp(
                         w.host, acct_sp.client_id, acct_sp.client_secret,
@@ -97,9 +100,6 @@ def get_workspace_clients() -> dict[str, WorkspaceClient]:
                 except Exception as exc:
                     print(f"WARNING: Could not build SP client for {w.name} ({w.host}): {exc}",
                           file=sys.stderr)
-            elif is_current:
-                # No settings SP — fall back to app SP for current workspace only.
-                clients[w.name] = _default
             # else: non-current workspace with no credentials — skip
 
         if clients:
